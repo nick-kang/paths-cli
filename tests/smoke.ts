@@ -78,6 +78,9 @@ async function checkManager(
   const results: Result[] = batch.split('\n').map((line) => JSON.parse(line));
   assert.deepEqual(results.map((result) => result.request), ['paths-fixture', 'not-installed', 'paths-fixture']);
   const first = results[0].result;
+  if (!first && manager === 'npm') {
+    console.error(await run(['npm', 'ls', '--all', '--long', '--json', '--include=dev', '--include=optional', '--workspaces', '--include-workspace-root'], project, env));
+  }
   assert.ok(first, batch);
   assert.equal(first.version, '1.0.0');
   assert.equal(first.commit, commits['1.0.0']);
