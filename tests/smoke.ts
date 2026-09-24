@@ -118,7 +118,8 @@ async function checkManager(
 
 async function main(): Promise<void> {
   assert.ok(Number(process.versions.node.split('.')[0]) >= 26, 'Run the integration test with Node.js 26+');
-  const temp = realpathSync(mkdtempSync(join(tmpdir(), 'paths-smoke-')));
+  // Match Rust's canonical paths, including expansion of Windows 8.3 aliases.
+  const temp = realpathSync.native(mkdtempSync(join(tmpdir(), 'paths-smoke-')));
   try {
     // Isolate registry credentials and Git settings from the developer's machine.
     const npmrc = join(temp, 'npmrc');
