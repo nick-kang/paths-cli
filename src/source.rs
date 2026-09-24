@@ -195,6 +195,7 @@ pub fn git(directory: &Path, args: &[&str]) -> Result<String> {
         "core.hooksPath=/dev/null"
     };
     command
+        .current_dir(directory)
         .args([
             "-c",
             hooks,
@@ -207,8 +208,6 @@ pub fn git(directory: &Path, args: &[&str]) -> Result<String> {
             "-c",
             "filter.lfs.required=false",
         ])
-        .arg("-C")
-        .arg(directory)
         .args(args)
         .env("GIT_TERMINAL_PROMPT", "0")
         .env("GIT_LFS_SKIP_SMUDGE", "1")

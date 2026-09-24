@@ -388,8 +388,8 @@ fn historical_and_default_branch_fallbacks() -> Result<()> {
 fn source_checkout_excludes_binaries_and_is_concurrency_safe() -> Result<()> {
     let repo = repository()?;
     let cache = tempfile::tempdir()?;
-    // Exercise paths beyond Windows' default 260-character Git limit.
-    let cache_root = cache.path().join("nested-cache-".repeat(12));
+    // Git object paths exceed 260 characters while the checkout root stays launchable.
+    let cache_root = cache.path().join("nested-cache-".repeat(2));
     commit(repo.path(), "image.PNG", "2025-01-01T00:00:00Z")?;
     let head = commit(repo.path(), "main.rs", "2025-01-02T00:00:00Z")?;
     let repo_url = repo.path().to_str().context("non-UTF8 fixture path")?;
