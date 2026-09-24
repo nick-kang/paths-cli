@@ -41,8 +41,6 @@ jobs:
           node-version: "26"
       - uses: actions-rust-lang/setup-rust-toolchain@v2
       - uses: pnpm/action-setup@v6
-        with:
-          version: "12"
       - run: pnpm install --frozen-lockfile --ignore-scripts
       - uses: actions-rust-lang/rustfmt@v1
       - run: cargo clippy --locked --all-targets --all-features -- -D warnings
@@ -73,8 +71,6 @@ jobs:
           node-version: "26"
           registry-url: https://registry.npmjs.org
       - uses: pnpm/action-setup@v6
-        with:
-          version: "12"
       - run: pnpm install --frozen-lockfile --ignore-scripts
       - uses: actions/download-artifact@v4
         with:
