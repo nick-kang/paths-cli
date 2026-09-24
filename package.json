@@ -1,0 +1,39 @@
+{
+  "name": "paths-cli",
+  "version": "0.1.0",
+  "description": "Find cached Git source checkouts for installed npm and pnpm dependencies",
+  "license": "MIT",
+  "type": "module",
+  "packageManager": "pnpm@12.0.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/nick-kang/paths-cli.git"
+  },
+  "bin": {
+    "paths": "bin/paths.cjs"
+  },
+  "files": [
+    "bin",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "os": [
+    "darwin",
+    "linux",
+    "win32"
+  ],
+  "cpu": [
+    "x64",
+    "arm64"
+  ],
+  "devDependencies": {
+    "cross-spawn": "^7.0.6",
+    "smol-toml": "^1.9.0"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}

@@ -1,0 +1,43 @@
+[package]
+name = "paths-cli"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+description = "Find cached Git source checkouts for installed npm and pnpm dependencies"
+license = "MIT"
+repository = "https://github.com/nick-kang/paths-cli"
+
+[[bin]]
+name = "paths"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+base64 = "0.22"
+chrono = { version = "0.4", default-features = false, features = ["std"] }
+clap = { version = "4", features = ["derive"] }
+directories = "6"
+dunce = "1"
+glob = "0.3"
+semver = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+tempfile = "3"
+ureq = { version = "3", features = ["json"] }
+url = "2"
+wait-timeout = "0.2"
+which = "8"
+
+[profile.release]
+lto = "thin"
+strip = true
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = { level = "deny", priority = -1 }
+pedantic = { level = "deny", priority = -1 }
+unwrap_used = "deny"
+expect_used = "deny"
