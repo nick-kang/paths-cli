@@ -200,6 +200,8 @@ pub fn git(directory: &Path, args: &[&str]) -> Result<String> {
             "-c",
             hooks,
             "-c",
+            "core.longpaths=true",
+            "-c",
             "filter.lfs.smudge=",
             "-c",
             "filter.lfs.process=",
