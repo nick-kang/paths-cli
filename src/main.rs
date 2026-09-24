@@ -1,3 +1,4 @@
+mod cache;
 mod command;
 mod project;
 mod source;
@@ -122,6 +123,7 @@ fn run(args: &Args) -> Result<bool> {
         .context("cannot determine cache directory; use --cache-dir")?;
     fs::create_dir_all(&cache)?;
     let cache = dunce::canonicalize(cache)?;
+    let mut usage = cache::Usage::default();
     let mut projects = None;
     let mut failed = false;
     let stdout = io::stdout();
@@ -129,6 +131,7 @@ fn run(args: &Args) -> Result<bool> {
     for spec in &args.dependencies {
         match resolve(spec, args, &root, manager, &mut projects, &cache) {
             Ok(resolved) => {
+                usage.record(&resolved.source);
                 if args.json {
                     writeln!(
                         output,
@@ -152,6 +155,7 @@ fn run(args: &Args) -> Result<bool> {
             }
         }
     }
+    usage.cleanup(&cache, cache::MAX_BYTES);
     Ok(failed)
 }
 

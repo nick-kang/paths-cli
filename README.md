@@ -42,7 +42,9 @@ paths --help
 
 Source matching is best effort. `paths` prefers the published commit, then a version tag. If neither is available, it tries a historical commit or the current default branch and warns that the source may differ from the package version.
 
-Checkouts are reused from your system's cache directory unless you set `--cache-dir`. Treat them as reference material: modified or incomplete checkouts are rejected rather than overwritten. Move an affected checkout aside and retry. Cache contents remain until manually removed.
+Checkouts are reused from your system's cache directory unless you set `--cache-dir`. Treat them as reference material: modified or incomplete checkouts are rejected rather than overwritten. Move an affected checkout aside and retry. The cache is shared across projects for the same OS user and has a fixed 5 GiB soft limit (also applied to each custom `--cache-dir`). After an invocation creates a checkout, `paths` removes least recently used checkouts until under the limit. Cache-only lookups update usage timestamps without scanning sizes. Modified or busy checkouts and all results from the current invocation are preserved, so the cache can exceed the limit. Older checkouts without usage metadata are removed first.
+
+Cache locks protect `paths` operations, but cannot detect editors or agents reading previously returned paths; a later invocation may evict those checkouts. Size is measured from filesystem entry lengths, including `.git`, rather than allocated disk blocks. Cleanup failures produce warnings without failing source lookups.
 
 Checkouts omit common binary files, source maps, Git LFS content, and submodules, so some fixtures or examples may be incomplete.
 

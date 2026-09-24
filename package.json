@@ -1,6 +1,6 @@
 {
   "name": "paths-cli",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "description": "Find cached Git source checkouts for installed npm and pnpm dependencies",
   "license": "MIT",
   "type": "module",

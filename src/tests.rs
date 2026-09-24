@@ -405,3 +405,199 @@ fn source_checkout_excludes_binaries_and_is_concurrency_safe() -> Result<()> {
     assert!(first.join("main.rs").is_file());
     Ok(())
 }
+
+#[test]
+fn cache_lru_tracks_usage_and_evicts_oldest() -> Result<()> {
+    use std::{
+        collections::HashSet,
+        fs::File,
+        time::{Duration, SystemTime},
+    };
+    let repo = repository()?;
+    let cache = tempfile::tempdir()?;
+    let url = repo.path().to_str().context("fixture path")?;
+    let mut paths = Vec::new();
+    for name in ["one.rs", "two.rs", "three.rs"] {
+        let head = commit(repo.path(), name, "2025-01-01T00:00:00Z")?;
+        paths.push(source::checkout(cache.path(), url, &head)?);
+    }
+    let old = SystemTime::UNIX_EPOCH + Duration::from_secs(10);
+    for path in &paths {
+        File::options()
+            .write(true)
+            .open(path.with_extension("last-used"))?
+            .set_modified(old)?;
+    }
+    let head = source::git(&paths[2], &["rev-parse", "HEAD"])?;
+    source::checkout(cache.path(), url, &head)?;
+    assert!(fs::metadata(paths[2].with_extension("last-used"))?.modified()? > old);
+    assert!(source::git(&paths[2], &["status", "--porcelain"])?.is_empty());
+    fs::remove_file(paths[1].with_extension("last-used"))?;
+    let total = paths
+        .iter()
+        .map(fs_extra::dir::get_size)
+        .collect::<fs_extra::error::Result<Vec<_>>>()?
+        .iter()
+        .sum::<u64>();
+    let budget = total - fs_extra::dir::get_size(&paths[1])?;
+    assert!(crate::cache::prune(cache.path(), budget, &HashSet::new())?);
+    assert!(!paths[1].exists());
+    assert!(paths[0].exists());
+    assert!(paths[2].exists());
+    assert!(crate::cache::prune(
+        cache.path(),
+        fs_extra::dir::get_size(&paths[2])?,
+        &HashSet::new()
+    )?);
+    assert!(!paths[0].exists());
+    assert!(!paths[0].with_extension("last-used").exists());
+    assert!(paths[2].exists());
+    // Equal timestamps are resolved by path, independent of directory enumeration.
+    let first_commit = paths[0]
+        .file_name()
+        .and_then(|name| name.to_str())
+        .context("commit")?;
+    source::checkout(cache.path(), url, first_commit)?;
+    let mut tied = [paths[0].clone(), paths[2].clone()];
+    tied.sort();
+    for path in &tied {
+        File::options()
+            .write(true)
+            .open(path.with_extension("last-used"))?
+            .set_modified(old)?;
+    }
+    assert!(crate::cache::prune(
+        cache.path(),
+        fs_extra::dir::get_size(&tied[1])?,
+        &HashSet::new()
+    )?);
+    assert!(!tied[0].exists() && tied[1].exists());
+    Ok(())
+}
+
+#[test]
+fn cache_cleanup_preserves_protected_dirty_and_busy_checkouts() -> Result<()> {
+    use std::{collections::HashSet, fs::File};
+    let repo = repository()?;
+    let cache = tempfile::tempdir()?;
+    let url = repo.path().to_str().context("fixture path")?;
+    fs::write(repo.path().join(".gitignore"), "ignored\n")?;
+    let head = commit(repo.path(), "main.rs", "2025-01-01T00:00:00Z")?;
+    let path = source::checkout(cache.path(), url, &head)?;
+    let protected = HashSet::from([path.clone()]);
+    assert!(!crate::cache::prune(cache.path(), 0, &protected)?);
+    let lock = File::options()
+        .read(true)
+        .write(true)
+        .open(path.parent().context("parent")?.join(".lock"))?;
+    lock.lock()?;
+    assert!(!crate::cache::prune(cache.path(), 0, &HashSet::new())?);
+    drop(lock);
+    for name in ["ignored", "untracked", "main.rs"] {
+        let file = path.join(name);
+        let original = fs::read(&file).ok();
+        fs::write(&file, "do not delete")?;
+        assert!(!crate::cache::prune(cache.path(), 0, &HashSet::new())?);
+        assert!(path.exists());
+        if let Some(original) = original {
+            fs::write(file, original)?;
+        } else {
+            fs::remove_file(file)?;
+        }
+    }
+    fs::remove_dir_all(path.join(".git"))?;
+    assert!(!crate::cache::prune(cache.path(), 0, &HashSet::new())?);
+    assert!(path.with_extension("last-used").exists());
+    Ok(())
+}
+
+#[test]
+fn cache_cleanup_runs_only_on_growth_and_protects_batch() -> Result<()> {
+    let repo = repository()?;
+    let cache = tempfile::tempdir()?;
+    let url = repo.path().to_str().context("fixture path")?;
+    let unused_commit = commit(repo.path(), "unused.rs", "2025-01-01T00:00:00Z")?;
+    let unused = source::checkout(cache.path(), url, &unused_commit)?;
+    let first = commit(repo.path(), "first.rs", "2025-01-01T00:00:00Z")?;
+    source::checkout(cache.path(), url, &first)?;
+    let hit = source::materialize(cache.path(), url, "1.0.0", &json!({"gitHead": first}))?;
+    assert!(!hit.created);
+    let mut usage = crate::cache::Usage::default();
+    usage.record(&hit);
+    usage.cleanup(cache.path(), 0);
+    assert!(unused.exists());
+    let second = commit(repo.path(), "second.rs", "2025-01-01T00:00:00Z")?;
+    let added = source::materialize(cache.path(), url, "2.0.0", &json!({"gitHead": second}))?;
+    assert!(added.created);
+    usage.record(&added);
+    usage.cleanup(cache.path(), 0);
+    assert!(hit.path.exists() && added.path.exists());
+    assert!(!unused.exists());
+    // Bad metadata must disable cleanup, leaving even unprotected entries intact.
+    fs::remove_file(added.path.with_extension("last-used"))?;
+    fs::create_dir(added.path.with_extension("last-used"))?;
+    let bad = source::materialize(cache.path(), url, "2.0.0", &json!({"gitHead": second}))?;
+    assert!(!bad.usage_recorded);
+    let mut usage = crate::cache::Usage::default();
+    usage.record(&added);
+    usage.record(&bad);
+    usage.cleanup(cache.path(), 0);
+    assert!(hit.path.exists());
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn cache_cleanup_does_not_follow_symlinks() -> Result<()> {
+    use std::{collections::HashSet, os::unix::fs::symlink};
+    let repo = repository()?;
+    let cache = tempfile::tempdir()?;
+    let url = repo.path().to_str().context("fixture path")?;
+    let head = commit(repo.path(), "main.rs", "2025-01-01T00:00:00Z")?;
+    let path = source::checkout(cache.path(), url, &head)?;
+    let outside = tempfile::tempdir()?;
+    fs::write(outside.path().join("keep"), "keep")?;
+    symlink(outside.path(), path.join("external"))?;
+    symlink(outside.path(), cache.path().join("v1/external"))?;
+    assert!(!crate::cache::prune(cache.path(), 0, &HashSet::new())?);
+    assert!(outside.path().join("keep").exists());
+    fs::remove_file(path.join("external"))?;
+    fs::remove_file(path.with_extension("last-used"))?;
+    symlink(
+        outside.path().join("keep"),
+        path.with_extension("last-used"),
+    )?;
+    assert!(!crate::cache::record_use(&path));
+    assert!(!crate::cache::prune(cache.path(), 0, &HashSet::new())?);
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn cache_cleanup_handles_sizing_and_deletion_failures() -> Result<()> {
+    use std::{collections::HashSet, os::unix::fs::PermissionsExt};
+    let repo = repository()?;
+    let cache = tempfile::tempdir()?;
+    let url = repo.path().to_str().context("fixture path")?;
+    let head = commit(repo.path(), "main.rs", "2025-01-01T00:00:00Z")?;
+    let path = source::checkout(cache.path(), url, &head)?;
+    let original = fs::metadata(&path)?.permissions();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o0))?;
+    if fs::read_dir(&path).is_ok() {
+        fs::set_permissions(&path, original)?;
+        return Ok(()); // Root can bypass mode bits.
+    }
+    let result = crate::cache::prune(cache.path(), 0, &HashSet::new());
+    fs::set_permissions(&path, original)?;
+    assert!(result.is_err());
+    assert!(path.with_extension("last-used").exists());
+    let parent = path.parent().context("parent")?;
+    let original = fs::metadata(parent)?.permissions();
+    fs::set_permissions(parent, fs::Permissions::from_mode(0o555))?;
+    let result = crate::cache::prune(cache.path(), 0, &HashSet::new());
+    fs::set_permissions(parent, original)?;
+    assert!(!result?);
+    assert!(path.exists());
+    assert!(path.with_extension("last-used").exists());
+    Ok(())
+}

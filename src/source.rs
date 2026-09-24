@@ -265,7 +265,7 @@ fn sparse_patterns() -> Vec<String> {
         .collect()
 }
 
-fn cache_repository(cache: &Path, repository: &str) -> PathBuf {
+pub(crate) fn cache_repository(cache: &Path, repository: &str) -> PathBuf {
     let hash = format!("{:x}", Sha256::digest(repository.as_bytes()));
     let label = repository
         .trim_end_matches('/')
@@ -286,7 +286,7 @@ fn cache_repository(cache: &Path, repository: &str) -> PathBuf {
     cache.join("v1").join(format!("{label}-{hash}"))
 }
 
-fn current_checkout(path: &Path, repository: &str, commit: &str) -> Result<bool> {
+pub(crate) fn current_checkout(path: &Path, repository: &str, commit: &str) -> Result<bool> {
     if !path.exists() {
         return Ok(false);
     }
@@ -309,7 +309,12 @@ fn current_checkout(path: &Path, repository: &str, commit: &str) -> Result<bool>
     Ok(true)
 }
 
+#[cfg(test)]
 pub fn checkout(cache: &Path, repository: &str, commit: &str) -> Result<PathBuf> {
+    Ok(checkout_tracked(cache, repository, commit)?.0)
+}
+
+fn checkout_tracked(cache: &Path, repository: &str, commit: &str) -> Result<(PathBuf, bool, bool)> {
     ensure!(normalize_commit(commit).is_some(), "invalid Git commit");
     let parent = cache_repository(cache, repository);
     fs::create_dir_all(&parent)?;
@@ -322,7 +327,8 @@ pub fn checkout(cache: &Path, repository: &str, commit: &str) -> Result<PathBuf>
     lock.lock()?;
     let destination = parent.join(commit);
     if current_checkout(&destination, repository, commit)? {
-        return Ok(destination);
+        let recorded = crate::cache::record_use(&destination);
+        return Ok((destination, false, recorded));
     }
     let temporary = tempfile::tempdir_in(&parent)?;
     git(temporary.path(), &["init", "--quiet"])?;
@@ -361,7 +367,8 @@ pub fn checkout(cache: &Path, repository: &str, commit: &str) -> Result<PathBuf>
     );
     fs::rename(temporary.path(), &destination)
         .context("unable to publish source checkout to cache")?;
-    Ok(destination)
+    let recorded = crate::cache::record_use(&destination);
+    Ok((destination, true, recorded))
 }
 
 #[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
@@ -379,6 +386,10 @@ pub struct Source {
     pub repository: String,
     pub commit: String,
     pub method: Method,
+    #[serde(skip)]
+    pub created: bool,
+    #[serde(skip)]
+    pub usage_recorded: bool,
 }
 
 fn try_revision(
@@ -391,8 +402,10 @@ fn try_revision(
     if !tried.insert(commit.to_owned()) {
         return Ok(None);
     }
-    match checkout(cache, repository, commit) {
-        Ok(path) => Ok(Some(Source {
+    match checkout_tracked(cache, repository, commit) {
+        Ok((path, created, usage_recorded)) => Ok(Some(Source {
+            created,
+            usage_recorded,
             path,
             repository: repository.to_owned(),
             commit: commit.to_owned(),
@@ -455,8 +468,10 @@ pub fn materialize(
         })
         .context("remote repository has no default-branch commit")?;
     // HEAD may equal an earlier candidate; retry it as the final fallback.
-    let path = checkout(cache, repository, &commit)?;
+    let (path, created, usage_recorded) = checkout_tracked(cache, repository, &commit)?;
     Ok(Source {
+        created,
+        usage_recorded,
         path,
         repository: repository.to_owned(),
         commit,
