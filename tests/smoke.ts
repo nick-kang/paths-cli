@@ -78,7 +78,7 @@ async function checkManager(
   const results: Result[] = batch.split('\n').map((line) => JSON.parse(line));
   assert.deepEqual(results.map((result) => result.request), ['paths-fixture', 'not-installed', 'paths-fixture']);
   const first = results[0].result;
-  assert.ok(first);
+  assert.ok(first, batch);
   assert.equal(first.version, '1.0.0');
   assert.equal(first.commit, commits['1.0.0']);
   assert.equal(results[2].result?.path, first.path);
