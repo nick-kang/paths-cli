@@ -134,6 +134,41 @@ fn manager_detection_and_specs() -> Result<()> {
 }
 
 #[test]
+fn cargo_and_mixed_project_detection() -> Result<()> {
+    use project::Manager::{Cargo, Npm};
+
+    let temp = tempfile::tempdir()?;
+    let root = temp.path();
+    fs::write(root.join("Cargo.toml"), "[workspace]\n")?;
+    fs::create_dir_all(root.join("src"))?;
+    assert_eq!(project::discover(&root.join("src"), None)?.1, Cargo);
+    fs::write(root.join("package.json"), "{}")?;
+    fs::write(root.join("package-lock.json"), "{}")?;
+    assert!(project::discover(root, None).is_err());
+    assert_eq!(project::discover(root, Some(Cargo))?.1, Cargo);
+    assert_eq!(project::discover(root, Some(Npm))?.1, Npm);
+
+    let rust = root.join("rust");
+    fs::create_dir_all(rust.join("src"))?;
+    fs::write(rust.join("Cargo.toml"), "[package]\n")?;
+    assert_eq!(
+        project::discover(&rust.join("src"), None)?,
+        (rust.clone(), Cargo)
+    );
+    assert_eq!(project::discover(&rust, Some(Npm))?.1, Npm);
+    let node = root.join("node");
+    fs::create_dir(&node)?;
+    fs::write(node.join("package.json"), "{}")?;
+    fs::write(node.join("package-lock.json"), "{}")?;
+    assert_eq!(project::discover(&node, None)?, (node, Npm));
+
+    fs::remove_file(rust.join("Cargo.toml"))?;
+    fs::create_dir(rust.join(".git"))?;
+    assert!(project::discover(&rust, None).is_err());
+    Ok(())
+}
+
+#[test]
 fn repository_urls_and_commits() {
     for input in [
         "example/source",

@@ -1,7 +1,7 @@
 {
   "name": "paths-cli",
-  "version": "0.2.0",
-  "description": "Find cached Git source checkouts for installed npm and pnpm dependencies",
+  "version": "0.3.0",
+  "description": "Find local source directories for npm, pnpm, and Cargo dependencies",
   "license": "MIT",
   "type": "module",
   "packageManager": "pnpm@12.0.0",

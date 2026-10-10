@@ -19,8 +19,11 @@ Run the CLI locally:
 
 ```sh
 cargo run --locked -- --help
-cargo run --locked -- react@19.0.0 --json
+cargo run --locked -- --package-manager pnpm react@19.0.0 --json
+cargo run --locked -- --package-manager cargo serde --json
 ```
+
+This repository has both Node and Cargo manifests, so dependency lookups require an explicit package manager. Cargo lookups use the local resolved sources and preserve `Cargo.lock`; run `cargo fetch` first if the lockfile is missing or stale.
 
 Before opening a pull request, run the checks used by CI:
 
@@ -35,7 +38,7 @@ node tests/smoke.ts
 
 Use `cargo fmt --all` to apply formatting. Clippy's `all` and `pedantic` groups are enforced, `unwrap` and `expect` are denied, and unsafe Rust is forbidden.
 
-The Rust tests cover dependency selection, repository resolution, and cache behavior. The smoke test uses real npm and pnpm installations against a temporary local registry and Git repository, then installs the packed CLI into an isolated global prefix. It does not change your normal global installation. Both package managers must be on `PATH`.
+The Rust tests cover Node and Cargo dependency selection, repository resolution, and cache behavior. The smoke test exercises npm and pnpm against a temporary local registry and Git repository, plus Cargo projects with local path and Git dependencies. It checks lockfile preservation and cache bypass, and installs the packed CLI into an isolated global prefix without changing your normal global installation. npm, pnpm, and Cargo must be on `PATH`.
 
 `node scripts/package.ts` stages the release binary for your current platform under `bin/`. Rebuild and stage it again after changing Rust code. Local packaging and smoke tests require one of the supported platforms listed in [README.md](README.md).
 
@@ -43,7 +46,7 @@ The Rust tests cover dependency selection, repository resolution, and cache beha
 
 Create a branch and open a pull request against `main`. Explain the problem, the resulting behavior, and how you verified it. Add a focused regression check for behavior changes or bug fixes. Keep generated binaries, npm tarballs, and `node_modules` out of commits.
 
-Preserve the CLI's best-effort behavior: individual dependency failures must not stop the remaining requests, approximate source matches must be identified, and existing modified checkouts must not be overwritten. Package-manager support is limited to npm and pnpm.
+Preserve the CLI's best-effort behavior: individual dependency failures must not stop the remaining requests, approximate source matches must be identified, and existing modified checkouts must not be overwritten. Supported package managers are npm, pnpm, and Cargo. Cargo results use Cargo's source directories, omit Git revision fields in JSON, and bypass the paths cache; do not add Cargo sources to cache eviction or rewrite project lockfiles.
 
 ## Deployment
 

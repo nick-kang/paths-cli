@@ -1,4 +1,5 @@
 mod cache;
+mod cargo;
 mod command;
 mod project;
 mod source;
@@ -20,10 +21,10 @@ use serde_json::Value;
 #[command(
     name = "paths",
     version,
-    about = "Print cached Git source paths for npm and pnpm dependencies"
+    about = "Print local source paths for npm, pnpm, and Rust dependencies"
 )]
 struct Args {
-    /// Installed dependency names or name@exact-version requests
+    /// Dependency names or name@exact-version requests
     #[arg(required = true)]
     dependencies: Vec<String>,
     /// Exact workspace name or path relative to the project root
@@ -35,7 +36,7 @@ struct Args {
     /// Emit one JSON result per request, including failures
     #[arg(long)]
     json: bool,
-    /// Override the platform cache directory
+    /// Override the platform cache directory (npm/pnpm only)
     #[arg(long)]
     cache_dir: Option<PathBuf>,
 }
@@ -45,7 +46,14 @@ struct Resolved {
     name: String,
     version: String,
     #[serde(flatten)]
-    source: source::Source,
+    source: ResolvedSource,
+}
+
+#[derive(Serialize)]
+#[serde(untagged)]
+enum ResolvedSource {
+    Git(source::Source),
+    Cargo { path: PathBuf, method: &'static str },
 }
 
 fn resolve(
@@ -107,31 +115,48 @@ fn resolve(
     Ok(Resolved {
         name,
         version,
-        source,
+        source: ResolvedSource::Git(source),
     })
 }
 
 fn run(args: &Args) -> Result<bool> {
     let cwd = dunce::canonicalize(std::env::current_dir()?)?;
     let (root, manager) = project::discover(&cwd, args.package_manager)?;
-    let cache = args
-        .cache_dir
-        .clone()
-        .or_else(|| {
-            ProjectDirs::from("", "", "paths-cli").map(|dirs| dirs.cache_dir().to_path_buf())
-        })
-        .context("cannot determine cache directory; use --cache-dir")?;
-    fs::create_dir_all(&cache)?;
-    let cache = dunce::canonicalize(cache)?;
+    let cache = if manager == project::Manager::Cargo {
+        None
+    } else {
+        let cache = args
+            .cache_dir
+            .clone()
+            .or_else(|| {
+                ProjectDirs::from("", "", "paths-cli").map(|dirs| dirs.cache_dir().to_path_buf())
+            })
+            .context("cannot determine cache directory; use --cache-dir")?;
+        fs::create_dir_all(&cache)?;
+        Some(dunce::canonicalize(cache)?)
+    };
     let mut usage = cache::Usage::default();
     let mut projects = None;
+    let mut cargo = cargo::Resolver::default();
     let mut failed = false;
     let stdout = io::stdout();
     let mut output = stdout.lock();
     for spec in &args.dependencies {
-        match resolve(spec, args, &root, manager, &mut projects, &cache) {
+        let result = match &cache {
+            Some(cache) => resolve(spec, args, &root, manager, &mut projects, cache),
+            None => project::parse_spec(spec).and_then(|(name, version)| {
+                cargo.resolve(&root, args.filter.as_deref(), name, version)
+            }),
+        };
+        match result {
             Ok(resolved) => {
-                usage.record(&resolved.source);
+                let path = match &resolved.source {
+                    ResolvedSource::Git(source) => {
+                        usage.record(source);
+                        &source.path
+                    }
+                    ResolvedSource::Cargo { path, .. } => path,
+                };
                 if args.json {
                     writeln!(
                         output,
@@ -139,7 +164,7 @@ fn run(args: &Args) -> Result<bool> {
                         serde_json::json!({"request": spec, "result": resolved})
                     )?;
                 } else {
-                    writeln!(output, "{}", resolved.source.path.display())?;
+                    writeln!(output, "{}", path.display())?;
                 }
             }
             Err(error) => {
@@ -155,7 +180,9 @@ fn run(args: &Args) -> Result<bool> {
             }
         }
     }
-    usage.cleanup(&cache, cache::MAX_BYTES);
+    if let Some(cache) = cache {
+        usage.cleanup(&cache, cache::MAX_BYTES);
+    }
     Ok(failed)
 }
 

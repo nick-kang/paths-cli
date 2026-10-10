@@ -1,7 +1,7 @@
-// Integration test: real npm/pnpm workspaces, local registry/Git, and global npm installation.
+// Integration test: real npm/pnpm/Cargo workspaces, local registry/Git, and global npm installation.
 import assert from 'node:assert/strict';
 import { once } from 'node:events';
-import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
@@ -24,12 +24,12 @@ type Manifest = {
 };
 type Result = {
   request: string;
-  result?: { version: string; commit: string; path: string };
+  result?: { name: string; version: string; method: string; commit?: string; repository?: string; path: string };
   error?: string;
 };
 type Packed = { filename: string; shasum: string };
 
-async function run(args: string[], cwd: string, env: NodeJS.ProcessEnv, code = 0): Promise<string> {
+async function run(args: string[], cwd: string, env: NodeJS.ProcessEnv, code = 0, stderrPattern?: RegExp): Promise<string> {
   const child = spawn(args[0], args.slice(1), {
     cwd, env, stdio: ['ignore', 'pipe', 'pipe'], timeout: 120_000,
   });
@@ -39,6 +39,7 @@ async function run(args: string[], cwd: string, env: NodeJS.ProcessEnv, code = 0
   child.stderr.setEncoding('utf8').on('data', (chunk: string) => { stderr += chunk; });
   const [status, signal] = await once(child, 'close');
   assert.equal(status, code, `${JSON.stringify(args)} exited ${status} (${signal})\n${stdout}\n${stderr}`);
+  if (stderrPattern) assert.match(stderr, stderrPattern);
   return stdout.trim();
 }
 
@@ -82,8 +83,11 @@ async function checkManager(
     console.error(await run(['npm', 'ls', '--all', '--long', '--json', '--include=dev', '--include=optional', '--workspaces', '--include-workspace-root'], project, env));
   }
   assert.ok(first, batch);
+  assert.deepEqual(Object.keys(first).sort(), ['commit', 'method', 'name', 'path', 'repository', 'version']);
   assert.equal(first.version, '1.0.0');
   assert.equal(first.commit, commits['1.0.0']);
+  assert.equal(first.repository, REPOSITORY);
+  assert.equal(first.method, 'published');
   assert.equal(results[2].result?.path, first.path);
   assert.ok(results[1].error);
   const second = (JSON.parse(await run([...args, '--filter', 'b', 'paths-fixture', '--json'], project, env)) as Result).result;
@@ -114,6 +118,110 @@ async function checkManager(
     assert.equal(await run([...args, '--filter', 'a', 'paths-fixture'], project, env), first.path);
   }
   console.log(`${manager} ${version}: workspace, transitive, scoped, alias, exact version, cache, and batch checks passed`);
+}
+
+function writeCrate(path: string, name: string, version: string, dependencies = ''): void {
+  mkdirSync(join(path, 'src'), { recursive: true });
+  writeFileSync(join(path, 'Cargo.toml'), `[package]\nname = ${JSON.stringify(name)}\nversion = ${JSON.stringify(version)}\nedition = "2021"\n\n[dependencies]\n${dependencies}`);
+  writeFileSync(join(path, 'src', 'lib.rs'), '');
+}
+
+async function checkCargo(temp: string, env: NodeJS.ProcessEnv, cli: string): Promise<void> {
+  const project = join(temp, 'cargo');
+  const cargoHome = join(temp, 'cargo-home');
+  const cargoEnv = { ...env, CARGO_HOME: cargoHome, CARGO_NET_OFFLINE: 'true' };
+  const deps = join(temp, 'cargo-deps');
+  for (const [directory, name, version] of [
+    ['shared-v1', 'shared', '1.0.0'], ['shared-v2', 'shared', '2.0.0'],
+    ['optional-v1', 'optional-leaf', '1.0.0'], ['optional-v2', 'optional-leaf', '2.0.0'],
+    ['transitive', 'transitive-leaf', '0.1.0'], ['b-only', 'b-only', '0.1.0'],
+  ]) writeCrate(join(deps, directory), name, version);
+  const pathDep = (directory: string) => `path = ${JSON.stringify(join(deps, directory))}`;
+  writeCrate(join(deps, 'parent'), 'parent', '0.1.0', `transitive-leaf = { ${pathDep('transitive')} }\n`);
+  const git = join(temp, 'cargo-git');
+  writeCrate(git, 'git-fixture', '0.3.0');
+  await run(['git', 'init', '--initial-branch=main'], git, env);
+  await run(['git', 'add', '.'], git, env);
+  await run(['git', '-c', 'user.name=Paths Test', '-c', 'user.email=paths@example.test', 'commit', '-m', 'fixture'], git, env);
+
+  mkdirSync(project);
+  writeFileSync(join(project, 'Cargo.toml'), '[workspace]\nmembers = ["apps/a", "apps/b", "apps/empty"]\ndefault-members = ["apps/b", "apps/a"]\nresolver = "2"\n');
+  const a = join(project, 'apps', 'a');
+  const b = join(project, 'apps', 'b');
+  writeCrate(a, 'app-a', '0.1.0', [
+    `parent = { ${pathDep('parent')} }`,
+    `renamed-crate = { package = "shared", ${pathDep('shared-v1')} }`,
+    `new-shared = { package = "shared", ${pathDep('shared-v2')} }`,
+    `optional-leaf = { ${pathDep('optional-v1')}, optional = true }`,
+    `git-fixture = { git = ${JSON.stringify(pathToFileURL(git).href)} }`,
+  ].join('\n'));
+  writeCrate(b, 'app-b', '0.2.0', [
+    `shared = { ${pathDep('shared-v2')} }`,
+    `optional-leaf = { ${pathDep('optional-v2')} }`,
+    `b-only = { ${pathDep('b-only')} }`,
+  ].join('\n'));
+  writeCrate(join(project, 'apps', 'empty'), 'app-empty', '0.1.0');
+  // The only Git fetch is file://; subsequent CLI calls cannot use the public network.
+  await run(['cargo', 'generate-lockfile'], project, { ...cargoEnv, CARGO_NET_OFFLINE: 'false' });
+  const lockPath = join(project, 'Cargo.lock');
+  const lock = readFileSync(lockPath, 'utf8');
+  const cache = join(temp, 'cargo-paths-cache');
+  const args = [cli, '--cache-dir', cache];
+  const sharedV1 = join(deps, 'shared-v1');
+  const sharedV2 = join(deps, 'shared-v2');
+  const batchRequests = ['shared', 'not-installed', 'shared@2.0.0', 'shared@9.0.0', 'shared@^1.0.0', 'git-fixture'];
+  const batch = await run([...args, ...batchRequests, '--json'], project, cargoEnv, 1);
+  const results: Result[] = batch.split('\n').map((line) => JSON.parse(line));
+  assert.deepEqual(results.map((result) => result.request), batchRequests);
+  assert.equal(results[0].result?.path, sharedV1);
+  assert.equal(results[2].result?.path, sharedV2);
+  assert.ok(results[1].error);
+  assert.ok(results[3].error);
+  assert.ok(results[4].error);
+  for (const result of results.flatMap((entry) => entry.result ? [entry.result] : [])) {
+    assert.deepEqual(Object.keys(result).sort(), ['method', 'name', 'path', 'version']);
+    assert.equal(result.method, 'cargo');
+    assert.ok(existsSync(join(result.path, 'Cargo.toml')));
+  }
+  const gitResult = results.at(-1)?.result;
+  assert.equal(gitResult?.version, '0.3.0');
+  assert.ok(gitResult?.path.startsWith(join(cargoHome, 'git', 'checkouts')));
+  assert.equal(await run([...args, 'renamed-crate'], a, cargoEnv), sharedV1);
+  assert.equal(await run([...args, 'renamed_crate'], a, cargoEnv), sharedV1);
+  assert.equal(await run([...args, 'transitive-leaf'], a, cargoEnv), join(deps, 'transitive'));
+  assert.equal(await run([...args, 'optional-leaf'], a, cargoEnv), join(deps, 'optional-v1'));
+  assert.equal(await run([...args, 'shared'], b, cargoEnv), sharedV2);
+  assert.equal(await run([...args, 'app-b'], b, cargoEnv), b);
+  assert.equal(await run([...args, '--filter', 'app-b', 'shared'], project, cargoEnv), sharedV2);
+  assert.equal(await run([...args, '--filter', 'apps/b', 'shared'], join(a, 'src'), cargoEnv), sharedV2);
+  assert.equal(await run([...args, '--filter', 'app-empty', 'shared'], project, cargoEnv, 0, /warning:/), sharedV1);
+  assert.equal(await run([...args, 'b-only'], a, cargoEnv, 0, /warning:/), join(deps, 'b-only'));
+  const invalidFilter: Result = JSON.parse(await run([...args, '--filter', 'missing', 'shared', '--json'], project, cargoEnv, 1));
+  assert.ok(invalidFilter.error);
+  assert.equal(readFileSync(lockPath, 'utf8'), lock);
+  assert.equal(existsSync(cache), false);
+  const invalidCache = join(temp, 'cargo-cache-file');
+  writeFileSync(invalidCache, 'untouched');
+  assert.equal(await run([cli, '--cache-dir', invalidCache, 'app-a'], a, cargoEnv), a);
+  assert.equal(readFileSync(invalidCache, 'utf8'), 'untouched');
+
+  writeJson(join(project, 'package.json'), { name: 'mixed-project', version: '1.0.0' });
+  assert.equal(await run([...args, 'shared', '--json'], project, cargoEnv, 1, /--package-manager/), '');
+  assert.equal(await run([...args, '--package-manager', 'cargo', 'shared'], project, cargoEnv), sharedV1);
+  assert.equal(await run([...args, 'shared'], b, cargoEnv), sharedV2);
+  rmSync(join(project, 'package.json'));
+
+  rmSync(lockPath);
+  await run([...args, 'app-a'], a, cargoEnv, 1, /cargo fetch/);
+  assert.equal(existsSync(lockPath), false);
+  writeFileSync(lockPath, lock);
+  const manifestPath = join(a, 'Cargo.toml');
+  const manifest = readFileSync(manifestPath, 'utf8');
+  writeFileSync(manifestPath, manifest.replace('version = "0.1.0"', 'version = "0.1.1"'));
+  await run([...args, 'app-a'], a, cargoEnv, 1, /cargo fetch/);
+  assert.equal(readFileSync(lockPath, 'utf8'), lock);
+  assert.equal(existsSync(cache), false);
+  console.log('Cargo: local Git/path sources, versions, aliases, features, workspaces, JSON, lock preservation, and cache bypass passed');
 }
 
 async function main(): Promise<void> {
@@ -195,6 +303,7 @@ async function main(): Promise<void> {
       for (const manager of ['npm', 'pnpm'] as const) {
         await checkManager(manager, temp, env, registry, cli, commits);
       }
+      await checkCargo(temp, env, cli);
     } finally {
       server.closeAllConnections();
       await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));

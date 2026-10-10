@@ -1,9 +1,9 @@
 [package]
 name = "paths-cli"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 rust-version = "1.89"
-description = "Find cached Git source checkouts for installed npm and pnpm dependencies"
+description = "Find local source directories for npm, pnpm, and Cargo dependencies"
 license = "MIT"
 repository = "https://github.com/nick-kang/paths-cli"
 

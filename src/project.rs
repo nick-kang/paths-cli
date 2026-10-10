@@ -16,6 +16,7 @@ use crate::command;
 pub enum Manager {
     Npm,
     Pnpm,
+    Cargo,
 }
 
 impl Manager {
@@ -23,10 +24,11 @@ impl Manager {
         match self {
             Self::Npm => "npm",
             Self::Pnpm => "pnpm",
+            Self::Cargo => "cargo",
         }
     }
 
-    fn command(self, root: &Path) -> Result<Command> {
+    pub(crate) fn command(self, root: &Path) -> Result<Command> {
         let executable = which::which(self.executable())
             .with_context(|| format!("{} must be installed and on PATH", self.executable()))?;
         let mut command = Command::new(executable);
@@ -43,6 +45,28 @@ pub fn read_json(path: &Path) -> Result<Value> {
 }
 
 pub fn discover(cwd: &Path, override_manager: Option<Manager>) -> Result<(PathBuf, Manager)> {
+    for directory in cwd.ancestors() {
+        let node = directory.join("package.json").is_file()
+            || directory.join("pnpm-workspace.yaml").is_file();
+        let cargo = directory.join("Cargo.toml").is_file();
+        if override_manager != Some(Manager::Cargo) && node {
+            ensure!(
+                override_manager.is_some() || !cargo,
+                "both Node and Cargo manifests found; use --package-manager npm|pnpm|cargo"
+            );
+            return discover_node(cwd, override_manager);
+        }
+        if cargo && override_manager.is_none_or(|manager| manager == Manager::Cargo) {
+            return Ok((directory.to_path_buf(), Manager::Cargo));
+        }
+        if directory.join(".git").exists() {
+            break;
+        }
+    }
+    bail!("no matching project manifest found in this directory or its parents")
+}
+
+fn discover_node(cwd: &Path, override_manager: Option<Manager>) -> Result<(PathBuf, Manager)> {
     let mut nearest = None;
     let mut root = None;
     for directory in cwd.ancestors() {
@@ -79,7 +103,9 @@ pub fn discover(cwd: &Path, override_manager: Option<Manager>) -> Result<(PathBu
             Some("npm") => Manager::Npm,
             Some("pnpm") => Manager::Pnpm,
             _ => {
-                bail!("unsupported package manager {declaration}; only npm and pnpm are supported")
+                bail!(
+                    "unsupported Node package manager {declaration}; only npm and pnpm are supported"
+                )
             }
         };
         return Ok((root, manager));
@@ -156,6 +182,7 @@ pub struct Project {
 pub fn load_projects(root: &Path, manager: Manager) -> Result<Vec<Project>> {
     let mut cmd = manager.command(root)?;
     let graphs = match manager {
+        Manager::Cargo => bail!("Cargo dependencies are resolved with cargo metadata"),
         Manager::Pnpm => {
             cmd.args(["--recursive", "list", "--depth", "Infinity", "--json"]);
             let text = command::checked(&mut cmd)?;
