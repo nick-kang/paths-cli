@@ -126,7 +126,7 @@ function writeCrate(path: string, name: string, version: string, dependencies = 
   writeFileSync(join(path, 'src', 'lib.rs'), '');
 }
 
-async function checkCargo(temp: string, env: NodeJS.ProcessEnv, cli: string): Promise<void> {
+async function checkCargo(temp: string, env: NodeJS.ProcessEnv, registry: string, cli: string): Promise<void> {
   const project = join(temp, 'cargo');
   const cargoHome = join(temp, 'cargo-home');
   const cargoEnv = { ...env, CARGO_HOME: cargoHome, CARGO_NET_OFFLINE: 'true' };
@@ -135,6 +135,7 @@ async function checkCargo(temp: string, env: NodeJS.ProcessEnv, cli: string): Pr
     ['shared-v1', 'shared', '1.0.0'], ['shared-v2', 'shared', '2.0.0'],
     ['optional-v1', 'optional-leaf', '1.0.0'], ['optional-v2', 'optional-leaf', '2.0.0'],
     ['transitive', 'transitive-leaf', '0.1.0'], ['b-only', 'b-only', '0.1.0'],
+    ['paths-fixture', 'paths-fixture', '2.0.0'],
   ]) writeCrate(join(deps, directory), name, version);
   const pathDep = (directory: string) => `path = ${JSON.stringify(join(deps, directory))}`;
   writeCrate(join(deps, 'parent'), 'parent', '0.1.0', `transitive-leaf = { ${pathDep('transitive')} }\n`);
@@ -150,6 +151,7 @@ async function checkCargo(temp: string, env: NodeJS.ProcessEnv, cli: string): Pr
   const b = join(project, 'apps', 'b');
   writeCrate(a, 'app-a', '0.1.0', [
     `parent = { ${pathDep('parent')} }`,
+    `paths-fixture = { ${pathDep('paths-fixture')} }`,
     `renamed-crate = { package = "shared", ${pathDep('shared-v1')} }`,
     `new-shared = { package = "shared", ${pathDep('shared-v2')} }`,
     `optional-leaf = { ${pathDep('optional-v1')}, optional = true }`,
@@ -205,11 +207,68 @@ async function checkCargo(temp: string, env: NodeJS.ProcessEnv, cli: string): Pr
   assert.equal(await run([cli, '--cache-dir', invalidCache, 'app-a'], a, cargoEnv), a);
   assert.equal(readFileSync(invalidCache, 'utf8'), 'untouched');
 
-  writeJson(join(project, 'package.json'), { name: 'mixed-project', version: '1.0.0' });
-  assert.equal(await run([...args, 'shared', '--json'], project, cargoEnv, 1, /--package-manager/), '');
-  assert.equal(await run([...args, '--package-manager', 'cargo', 'shared'], project, cargoEnv), sharedV1);
-  assert.equal(await run([...args, 'shared'], b, cargoEnv), sharedV2);
-  rmSync(join(project, 'package.json'));
+  for (const manager of ['npm', 'pnpm']) {
+    const manifestPath = join(project, 'package.json');
+    const manifest = {
+      name: 'mixed-project', version: '1.0.0', packageManager: `${manager}@${await run([manager, '--version'], project, env)}`,
+      dependencies: { 'paths-fixture': '1.0.0', 'node-only': 'npm:paths-fixture@1.0.0', 'renamed-crate': 'npm:paths-fixture@1.0.0' },
+    };
+    writeJson(manifestPath, manifest);
+    writeFileSync(join(project, '.npmrc'), `registry=${registry}\nfetch-retries=0\naudit=false\nfund=false\nminimum-release-age=0\n`);
+    const install = [manager, 'install', '--ignore-scripts'];
+    if (manager === 'pnpm') install.push('--no-frozen-lockfile');
+    await run(install, project, env);
+    const mixedCache = join(temp, `mixed-${manager}-cache`);
+    const mixedArgs = [cli, '--cache-dir', mixedCache];
+    const collision: Result = JSON.parse(await run([...mixedArgs, 'paths-fixture', '--json'], project, cargoEnv, 1, /--package-manager/));
+    assert.match(collision.error ?? '', /found in both Node and Cargo/);
+    await run([...mixedArgs, 'renamed-crate@1.0.0'], project, cargoEnv, 1, /found in both Node and Cargo/);
+    assert.equal(existsSync(mixedCache), false);
+    assert.equal(await run([...mixedArgs, 'shared'], project, cargoEnv), sharedV1);
+    assert.equal(await run([cli, '--cache-dir', invalidCache, 'shared'], project, cargoEnv), sharedV1);
+    assert.equal(existsSync(mixedCache), false);
+    assert.equal(await run([...mixedArgs, 'shared'], b, cargoEnv), sharedV2);
+    assert.equal(await run([...mixedArgs, '--filter', 'app-b', 'shared'], project, cargoEnv, 0, /cannot inspect Node/), sharedV2);
+    assert.equal(await run([...mixedArgs, 'paths-fixture@2.0.0'], project, cargoEnv), join(deps, 'paths-fixture'));
+    assert.equal(existsSync(mixedCache), false);
+
+    const requests = ['shared', 'paths-fixture', 'node-only', 'not-installed', 'paths-fixture@9.0.0', 'shared'];
+    const mixed: Result[] = (await run([...mixedArgs, ...requests, '--json'], project, cargoEnv, 1)).split('\n').map((line) => JSON.parse(line));
+    assert.deepEqual(mixed.map((entry) => entry.request), requests);
+    assert.equal(mixed[0].result?.method, 'cargo');
+    assert.match(mixed[1].error ?? '', /--package-manager/);
+    const node = mixed[2].result;
+    assert.ok(node);
+    assert.equal(node.name, 'paths-fixture');
+    assert.equal(node.method, 'published');
+    assert.deepEqual(Object.keys(node).sort(), ['commit', 'method', 'name', 'path', 'repository', 'version']);
+    assert.match(mixed[3].error ?? '', /not found in Node or Cargo/);
+    assert.match(mixed[4].error ?? '', /not found in Node or Cargo/);
+    assert.equal(mixed[5].result?.path, sharedV1);
+    assert.equal(await run([...mixedArgs, 'paths-fixture@1.0.0'], project, cargoEnv), node.path);
+    assert.equal(await run([...mixedArgs, '--package-manager', manager, 'paths-fixture'], project, cargoEnv), node.path);
+    assert.equal(await run([...mixedArgs, '--package-manager', 'cargo', 'paths-fixture'], project, cargoEnv), join(deps, 'paths-fixture'));
+
+    // A broken source URL must not hide a collision or trigger a checkout.
+    const installedPath = realpathSync.native(join(project, 'node_modules', 'paths-fixture', 'package.json'));
+    const installed = readFileSync(installedPath, 'utf8');
+    writeJson(installedPath, { ...JSON.parse(installed), repository: 'https://invalid.invalid/owner/repo' });
+    await run([cli, '--cache-dir', invalidCache, 'paths-fixture'], project, cargoEnv, 1, /found in both Node and Cargo/);
+    writeFileSync(installedPath, installed);
+
+    rmSync(lockPath);
+    assert.equal(await run([...mixedArgs, 'node-only'], project, cargoEnv, 0, /warning: cannot inspect Cargo.*cargo fetch/s), node.path);
+    await run([...mixedArgs, 'not-installed'], project, cargoEnv, 1, /Node: not found; Cargo:.*cargo fetch/s);
+    assert.equal(existsSync(lockPath), false);
+    writeFileSync(lockPath, lock);
+    writeJson(manifestPath, { ...manifest, packageManager: 'yarn@4.0.0' });
+    assert.equal(await run([...mixedArgs, 'shared'], project, cargoEnv, 0, /warning: cannot inspect Node/), sharedV1);
+    rmSync(manifestPath);
+    rmSync(join(project, 'node_modules'), { recursive: true });
+    for (const filename of ['package-lock.json', 'pnpm-lock.yaml']) rmSync(join(project, filename), { force: true });
+    console.log(`${manager}/Cargo: unique matches, collisions, overrides, exact versions, batch errors, and cache bypass passed`);
+  }
+  assert.equal(readFileSync(lockPath, 'utf8'), lock);
 
   rmSync(lockPath);
   await run([...args, 'app-a'], a, cargoEnv, 1, /cargo fetch/);
@@ -303,7 +362,7 @@ async function main(): Promise<void> {
       for (const manager of ['npm', 'pnpm'] as const) {
         await checkManager(manager, temp, env, registry, cli, commits);
       }
-      await checkCargo(temp, env, cli);
+      await checkCargo(temp, env, registry, cli);
     } finally {
       server.closeAllConnections();
       await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));

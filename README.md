@@ -29,9 +29,11 @@ paths serde                             # In a Rust project
 paths serde@1.0.228
 ```
 
-`paths` detects the nearest Node manifest (`package.json` or `pnpm-workspace.yaml`) or `Cargo.toml`, stopping at the Git boundary. If both families occur in that directory, select a manager explicitly.
+`paths` detects the nearest Node manifest (`package.json` or `pnpm-workspace.yaml`) or `Cargo.toml`, stopping at the Git boundary. If both families occur in that directory, it searches both dependency graphs for each request. A match in only one is returned; a match in both fails with guidance to select `--package-manager npm`, `pnpm`, or `cargo`. For example, `paths serde` works in a mixed project if only Cargo depends on `serde`.
 
 For npm/pnpm, `paths` uses the installed dependency's version and prints an absolute path to its source repository. You can request an exact `name@version` without installing that package first. For monorepos, the returned path is the repository root.
+
+In mixed projects, exact versions must occur in the installed Node graph or the resolved Cargo graph. Select a Node manager explicitly to request an uninstalled version. If one ecosystem cannot be inspected, a match from the other is returned with a warning; otherwise the lookup reports the inspection error.
 
 For Cargo, it prints the crate directory for a registry, Git, or path dependency, or the current crate itself. An exact `name@version` must exist in the project's resolved dependency graph; `paths` does not select arbitrary registry versions. Package names and dependency aliases are accepted. When multiple versions match within a package's graph, the nearest dependency wins, then the lowest semantic version, then path.
 
@@ -64,7 +66,7 @@ Cargo source directories are managed by Cargo. They bypass the paths cache, usag
 Add this guidance to your project's `AGENTS.md`:
 
 ```md
-When dependency behavior is unclear, run `paths <package> --json`. Inspect the returned source directory's implementation, tests, and examples when available. Read LLMS.md if present. In projects with both Node and Cargo manifests, pass --package-manager npm, pnpm, or cargo.
+When dependency behavior is unclear, run `paths <package> --json`. Inspect the returned source directory's implementation, tests, and examples when available. Read LLMS.md if present. If a dependency matches both Node and Cargo projects, pass --package-manager npm, pnpm, or cargo.
 
 Use the source for reference only. Keep changes in this project and continue importing dependencies normally. Check the reported resolution method before assuming the source exactly matches the installed version.
 ```

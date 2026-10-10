@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.3.1
+
+- Search both dependency graphs in mixed Node/Cargo projects and return a sole match. Require a package-manager override only when both match.
+
 ## 0.3.0
 
 - Add Rust crate lookups using Cargo's resolved local source directories, including aliases, exact resolved versions, optional dependencies, and workspace filters.

@@ -3,7 +3,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use anyhow::{Context, Result, anyhow, bail, ensure};
+use anyhow::{Context, Result, anyhow, ensure};
 use semver::Version;
 use serde::Deserialize;
 
@@ -22,15 +22,15 @@ impl Resolver {
         filter: Option<&str>,
         name: &str,
         version: Option<&str>,
-    ) -> Result<Resolved> {
+    ) -> Result<Option<Resolved>> {
         let metadata = self.metadata(root, false)?;
         let (primary, fallback) = workspace_roots(metadata, filter)?;
         if let Some(package) = find(metadata, &primary, name, version)? {
-            return resolved(package);
+            return resolved(package).map(Some);
         }
         let metadata = self.metadata(root, true)?;
         if let Some(package) = find(metadata, &primary, name, version)? {
-            return resolved(package);
+            return resolved(package).map(Some);
         }
         if !fallback.is_empty() {
             eprintln!(
@@ -38,12 +38,10 @@ impl Resolver {
                 filter.unwrap_or("the selected Cargo project")
             );
             if let Some(package) = find(metadata, &fallback, name, version)? {
-                return resolved(package);
+                return resolved(package).map(Some);
             }
         }
-        let request =
-            version.map_or_else(|| name.to_owned(), |version| format!("{name}@{version}"));
-        bail!("resolved Cargo dependency `{request}` not found")
+        Ok(None)
     }
 
     fn metadata(&mut self, root: &Path, all_features: bool) -> Result<&Metadata> {
@@ -432,14 +430,23 @@ mod tests {
             default: Some(Ok(default)),
             all_features: Some(Ok(all_features)),
         };
-        let result = resolver.resolve(&directory, None, "dep", None)?;
+        let result = resolver
+            .resolve(&directory, None, "dep", None)?
+            .context("missing dependency")?;
         let json = serde_json::to_value(result)?;
         assert_eq!(
             json,
             json!({"name": "dep", "version": "1.0.0", "path": directory.join("optional"), "method": "cargo"})
         );
-        let result = resolver.resolve(&directory, None, "dep", Some("2.0.0"))?;
+        let result = resolver
+            .resolve(&directory, None, "dep", Some("2.0.0"))?
+            .context("missing dependency")?;
         assert_eq!(result.version, "2.0.0");
+        assert!(
+            resolver
+                .resolve(&directory, None, "dep", Some("9.0.0"))?
+                .is_none()
+        );
         assert!(
             resolver
                 .resolve(&directory, Some("missing"), "dep", None)
@@ -465,7 +472,9 @@ mod tests {
                 .err()
                 .context("expected cached failure")?;
             assert_eq!(error.to_string(), "optional feature graph unavailable");
-            let result = resolver.resolve(directory.path(), None, "app", None)?;
+            let result = resolver
+                .resolve(directory.path(), None, "app", None)?
+                .context("missing dependency")?;
             assert_eq!(result.name, "app");
         }
         Ok(())

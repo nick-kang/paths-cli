@@ -16,19 +16,26 @@ fn dependency_selection_and_workspace_fallback() -> Result<()> {
         "alias": {"from": "target", "path": "/alias", "version": "2.0.0"}
     }, "devDependencies": {"target": {"path": "/direct", "version": "1.0.0"}}});
     assert_eq!(
-        project::find_dependency(&graph, "target")
+        project::find_dependency(&graph, "target", None)
             .context("missing dependency")?
             .path,
         Path::new("/direct")
     );
     let alias = json!({"dependencies": {"alias": {"name": "target", "path": "/alias", "version": "1.0.0"}}});
-    assert!(project::find_dependency(&alias, "target").is_some());
-    assert!(project::find_dependency(&alias, "alias").is_some());
+    assert!(project::find_dependency(&alias, "target", None).is_some());
+    assert!(project::find_dependency(&alias, "alias", None).is_some());
+    assert_eq!(
+        project::find_dependency(&graph, "target", Some("0.5.0"))
+            .context("missing version")?
+            .path,
+        Path::new("/nested")
+    );
+    assert!(project::find_dependency(&graph, "target", Some("9.0.0")).is_none());
     let first = json!({"optionalDependencies": {"parent": {"dependencies": {
         "@scope/target": {"path": "/transitive", "version": "1.0.0"}
     }}}});
     assert_eq!(
-        project::find_dependency(&first, "@scope/target")
+        project::find_dependency(&first, "@scope/target", None)
             .context("missing scoped dependency")?
             .depth,
         2
@@ -52,14 +59,21 @@ fn dependency_selection_and_workspace_fallback() -> Result<()> {
     ];
     for filter in [None, Some("empty")] {
         let selected =
-            project::select_dependency(&projects, Path::new("/"), filter, "@scope/target")?;
+            project::select_dependency(&projects, Path::new("/"), filter, "@scope/target", None)?
+                .context("missing dependency")?;
         assert_eq!(selected.path, Path::new("/transitive"));
     }
     assert!(
-        project::select_dependency(&projects, Path::new("/"), Some("unknown"), "@scope/target")
-            .is_err()
+        project::select_dependency(
+            &projects,
+            Path::new("/"),
+            Some("unknown"),
+            "@scope/target",
+            None
+        )
+        .is_err()
     );
-    assert!(project::find_dependency(&Value::Null, "missing").is_none());
+    assert!(project::find_dependency(&Value::Null, "missing", None).is_none());
     Ok(())
 }
 
@@ -69,14 +83,14 @@ fn repeated_graph_nodes_keep_the_shallowest_match() -> Result<()> {
     let graph =
         json!({"dependencies": {"target": target, "parent": {"dependencies": {"target": target}}}});
     assert_eq!(
-        project::find_dependency(&graph, "target")
+        project::find_dependency(&graph, "target", None)
             .context("missing")?
             .depth,
         1
     );
     let graph = json!({"dependencies": {"a": {"name": "target", "path": "/release", "version": "1.0.0"}, "b": {"name": "target", "path": "/pre", "version": "1.0.0-beta.1"}}});
     assert_eq!(
-        project::find_dependency(&graph, "target")
+        project::find_dependency(&graph, "target", None)
             .context("missing prerelease")?
             .path,
         Path::new("/pre")
@@ -97,19 +111,22 @@ fn manager_detection_and_specs() -> Result<()> {
     fs::write(root.join("package-lock.json"), "{}")?;
     assert_eq!(
         project::discover(&root.join("packages/web/src"), None)?.1,
-        project::Manager::Npm
+        Some(project::Manager::Npm)
     );
     fs::write(root.join("pnpm-lock.yaml"), "")?;
     assert!(project::discover(root, None).is_err());
     assert_eq!(
         project::discover(root, Some(project::Manager::Pnpm))?.1,
-        project::Manager::Pnpm
+        Some(project::Manager::Pnpm)
     );
     fs::write(
         root.join("package.json"),
         r#"{"packageManager":"pnpm@10.0.0"}"#,
     )?;
-    assert_eq!(project::discover(root, None)?.1, project::Manager::Pnpm);
+    assert_eq!(
+        project::discover(root, None)?.1,
+        Some(project::Manager::Pnpm)
+    );
     fs::write(
         root.join("package.json"),
         r#"{"packageManager":"yarn@4.0.0"}"#,
@@ -141,26 +158,26 @@ fn cargo_and_mixed_project_detection() -> Result<()> {
     let root = temp.path();
     fs::write(root.join("Cargo.toml"), "[workspace]\n")?;
     fs::create_dir_all(root.join("src"))?;
-    assert_eq!(project::discover(&root.join("src"), None)?.1, Cargo);
+    assert_eq!(project::discover(&root.join("src"), None)?.1, Some(Cargo));
     fs::write(root.join("package.json"), "{}")?;
     fs::write(root.join("package-lock.json"), "{}")?;
-    assert!(project::discover(root, None).is_err());
-    assert_eq!(project::discover(root, Some(Cargo))?.1, Cargo);
-    assert_eq!(project::discover(root, Some(Npm))?.1, Npm);
+    assert_eq!(project::discover(root, None)?, (root.to_path_buf(), None));
+    assert_eq!(project::discover(root, Some(Cargo))?.1, Some(Cargo));
+    assert_eq!(project::discover(root, Some(Npm))?.1, Some(Npm));
 
     let rust = root.join("rust");
     fs::create_dir_all(rust.join("src"))?;
     fs::write(rust.join("Cargo.toml"), "[package]\n")?;
     assert_eq!(
         project::discover(&rust.join("src"), None)?,
-        (rust.clone(), Cargo)
+        (rust.clone(), Some(Cargo))
     );
-    assert_eq!(project::discover(&rust, Some(Npm))?.1, Npm);
+    assert_eq!(project::discover(&rust, Some(Npm))?.1, Some(Npm));
     let node = root.join("node");
     fs::create_dir(&node)?;
     fs::write(node.join("package.json"), "{}")?;
     fs::write(node.join("package-lock.json"), "{}")?;
-    assert_eq!(project::discover(&node, None)?, (node, Npm));
+    assert_eq!(project::discover(&node, None)?, (node, Some(Npm)));
 
     fs::remove_file(rust.join("Cargo.toml"))?;
     fs::create_dir(rust.join(".git"))?;

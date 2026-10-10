@@ -44,20 +44,24 @@ pub fn read_json(path: &Path) -> Result<Value> {
     .with_context(|| format!("invalid JSON in {}", path.display()))
 }
 
-pub fn discover(cwd: &Path, override_manager: Option<Manager>) -> Result<(PathBuf, Manager)> {
+/// A missing manager means the nearest directory contains both manifest families.
+pub fn discover(
+    cwd: &Path,
+    override_manager: Option<Manager>,
+) -> Result<(PathBuf, Option<Manager>)> {
     for directory in cwd.ancestors() {
         let node = directory.join("package.json").is_file()
             || directory.join("pnpm-workspace.yaml").is_file();
         let cargo = directory.join("Cargo.toml").is_file();
         if override_manager != Some(Manager::Cargo) && node {
-            ensure!(
-                override_manager.is_some() || !cargo,
-                "both Node and Cargo manifests found; use --package-manager npm|pnpm|cargo"
-            );
-            return discover_node(cwd, override_manager);
+            if override_manager.is_none() && cargo {
+                return Ok((directory.to_path_buf(), None));
+            }
+            return discover_node(cwd, override_manager)
+                .map(|(root, manager)| (root, Some(manager)));
         }
         if cargo && override_manager.is_none_or(|manager| manager == Manager::Cargo) {
-            return Ok((directory.to_path_buf(), Manager::Cargo));
+            return Ok((directory.to_path_buf(), Some(Manager::Cargo)));
         }
         if directory.join(".git").exists() {
             break;
@@ -66,7 +70,10 @@ pub fn discover(cwd: &Path, override_manager: Option<Manager>) -> Result<(PathBu
     bail!("no matching project manifest found in this directory or its parents")
 }
 
-fn discover_node(cwd: &Path, override_manager: Option<Manager>) -> Result<(PathBuf, Manager)> {
+pub(crate) fn discover_node(
+    cwd: &Path,
+    override_manager: Option<Manager>,
+) -> Result<(PathBuf, Manager)> {
     let mut nearest = None;
     let mut root = None;
     for directory in cwd.ancestors() {
@@ -131,7 +138,7 @@ pub struct Dependency {
     pub version: String,
 }
 
-pub fn find_dependency(root: &Value, name: &str) -> Option<Dependency> {
+pub fn find_dependency(root: &Value, name: &str, version: Option<&str>) -> Option<Dependency> {
     let mut queue = VecDeque::from([(root, 0)]);
     let mut matches = Vec::new();
     while let Some((node, depth)) = queue.pop_front() {
@@ -146,6 +153,7 @@ pub fn find_dependency(root: &Value, name: &str) -> Option<Dependency> {
                         || child["from"].as_str() == Some(name))
                         && child["missing"] != true
                         && child["extraneous"] != true
+                        && version.is_none_or(|version| child["version"].as_str() == Some(version))
                         && let (Some(path), Some(version)) =
                             (child["path"].as_str(), child["version"].as_str())
                     {
@@ -280,7 +288,8 @@ pub fn select_dependency(
     root: &Path,
     filter: Option<&str>,
     name: &str,
-) -> Result<Dependency> {
+    version: Option<&str>,
+) -> Result<Option<Dependency>> {
     if let Some(filter) = filter {
         let filter_path = dunce::canonicalize(root.join(filter)).ok();
         let selected: Vec<_> = projects
@@ -292,17 +301,17 @@ pub fn select_dependency(
             "workspace filter `{filter}` matched {} projects; expected exactly one",
             selected.len()
         );
-        if let Some(dependency) = find_dependency(&selected[0].graph, name) {
-            return validate_dependency(dependency);
+        if let Some(dependency) = find_dependency(&selected[0].graph, name, version) {
+            return validate_dependency(dependency).map(Some);
         }
         eprintln!("warning: {name} is absent from {filter}; searching other workspaces");
     }
     for project in projects {
-        if let Some(dependency) = find_dependency(&project.graph, name) {
-            return validate_dependency(dependency);
+        if let Some(dependency) = find_dependency(&project.graph, name, version) {
+            return validate_dependency(dependency).map(Some);
         }
     }
-    bail!("installed dependency `{name}` not found")
+    Ok(None)
 }
 
 fn validate_dependency(dependency: Dependency) -> Result<Dependency> {

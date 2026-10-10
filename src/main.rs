@@ -11,7 +11,7 @@ use std::{
     process::ExitCode,
 };
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use clap::Parser;
 use directories::ProjectDirs;
 use serde::Serialize;
@@ -56,39 +56,84 @@ enum ResolvedSource {
     Cargo { path: PathBuf, method: &'static str },
 }
 
-fn resolve(
+struct NodePackage {
+    name: String,
+    version: String,
+    manifest: Value,
+}
+
+fn node_package(
     spec: &str,
     args: &Args,
     root: &std::path::Path,
     manager: project::Manager,
     projects: &mut Option<Vec<project::Project>>,
-    cache: &std::path::Path,
-) -> Result<Resolved> {
+    installed_only: bool,
+) -> Result<Option<NodePackage>> {
     let (requested_name, requested_version) = project::parse_spec(spec)?;
-    let (name, version, manifest) = if let Some(version) = requested_version {
-        (requested_name.to_owned(), version.to_owned(), Value::Null)
-    } else {
-        if projects.is_none() {
-            *projects = Some(project::load_projects(root, manager)?);
-        }
-        let dependency = project::select_dependency(
-            projects.as_deref().unwrap_or_default(),
-            root,
-            args.filter.as_deref(),
-            requested_name,
-        )?;
-        let manifest = project::read_json(&dependency.path.join("package.json"))?;
-        let name = manifest["name"]
-            .as_str()
-            .context("installed package has no name")?
-            .to_owned();
-        let version = manifest["version"]
-            .as_str()
-            .context("installed package has no version")?
-            .to_owned();
-        project::parse_spec(&format!("{name}@{version}"))?;
-        (name, version, manifest)
+    if let Some(version) = requested_version
+        && !installed_only
+    {
+        return Ok(Some(NodePackage {
+            name: requested_name.to_owned(),
+            version: version.to_owned(),
+            manifest: Value::Null,
+        }));
+    }
+    if projects.is_none() {
+        *projects = Some(project::load_projects(root, manager)?);
+    }
+    let Some(dependency) = project::select_dependency(
+        projects.as_deref().unwrap_or_default(),
+        root,
+        args.filter.as_deref(),
+        requested_name,
+        requested_version,
+    )?
+    else {
+        return Ok(None);
     };
+    let manifest = project::read_json(&dependency.path.join("package.json"))?;
+    let name = manifest["name"]
+        .as_str()
+        .context("installed package has no name")?
+        .to_owned();
+    let version = manifest["version"]
+        .as_str()
+        .context("installed package has no version")?
+        .to_owned();
+    project::parse_spec(&format!("{name}@{version}"))?;
+    Ok(Some(NodePackage {
+        name,
+        version,
+        manifest,
+    }))
+}
+
+fn materialize_node(
+    package: NodePackage,
+    args: &Args,
+    root: &std::path::Path,
+    manager: project::Manager,
+    cache: &mut Option<PathBuf>,
+) -> Result<Resolved> {
+    if cache.is_none() {
+        let path = args
+            .cache_dir
+            .clone()
+            .or_else(|| {
+                ProjectDirs::from("", "", "paths-cli").map(|dirs| dirs.cache_dir().to_path_buf())
+            })
+            .context("cannot determine cache directory; use --cache-dir")?;
+        fs::create_dir_all(&path)?;
+        *cache = Some(dunce::canonicalize(path)?);
+    }
+    let cache = cache.as_deref().context("missing source cache")?;
+    let NodePackage {
+        name,
+        version,
+        manifest,
+    } = package;
     let mut metadata = match project::metadata(root, manager, &name, &version) {
         Ok(value) => value,
         Err(error) => {
@@ -119,36 +164,85 @@ fn resolve(
     })
 }
 
+#[derive(Default)]
+struct Resolver {
+    projects: Option<Vec<project::Project>>,
+    cargo: cargo::Resolver,
+    cache: Option<PathBuf>,
+}
+
+impl Resolver {
+    fn resolve(
+        &mut self,
+        spec: &str,
+        args: &Args,
+        root: &std::path::Path,
+        manager: Option<project::Manager>,
+    ) -> Result<Resolved> {
+        let (name, version) = project::parse_spec(spec)?;
+        if manager == Some(project::Manager::Cargo) {
+            return self
+                .cargo
+                .resolve(root, args.filter.as_deref(), name, version)?
+                .with_context(|| format!("resolved Cargo dependency `{spec}` not found"));
+        }
+        if let Some(manager) = manager {
+            let package = node_package(spec, args, root, manager, &mut self.projects, false)?
+                .with_context(|| format!("installed dependency `{spec}` not found"))?;
+            return materialize_node(package, args, root, manager, &mut self.cache);
+        }
+        let node = project::discover_node(root, None).and_then(|(root, manager)| {
+            node_package(spec, args, &root, manager, &mut self.projects, true)
+                .map(|package| package.map(|package| (root, manager, package)))
+        });
+        let cargo = self
+            .cargo
+            .resolve(root, args.filter.as_deref(), name, version);
+        match (node, cargo) {
+            (Ok(Some(_)), Ok(Some(_))) => {
+                bail!(
+                    "dependency `{spec}` found in both Node and Cargo projects; use --package-manager npm|pnpm|cargo"
+                )
+            }
+            (Ok(Some((root, manager, package))), cargo) => {
+                if let Err(error) = cargo {
+                    eprintln!("warning: cannot inspect Cargo dependencies: {error:#}");
+                }
+                materialize_node(package, args, &root, manager, &mut self.cache)
+            }
+            (node, Ok(Some(resolved))) => {
+                if let Err(error) = node {
+                    eprintln!("warning: cannot inspect Node dependencies: {error:#}");
+                }
+                Ok(resolved)
+            }
+            (Ok(None), Ok(None)) => {
+                bail!("dependency `{spec}` not found in Node or Cargo projects")
+            }
+            (node, cargo) => {
+                let diagnostic = |error: Option<anyhow::Error>| {
+                    error.map_or_else(|| "not found".to_owned(), |error| format!("{error:#}"))
+                };
+                bail!(
+                    "cannot resolve `{spec}`; Node: {}; Cargo: {}",
+                    diagnostic(node.err()),
+                    diagnostic(cargo.err())
+                )
+            }
+        }
+    }
+}
+
 fn run(args: &Args) -> Result<bool> {
     let cwd = dunce::canonicalize(std::env::current_dir()?)?;
     let (root, manager) = project::discover(&cwd, args.package_manager)?;
-    let cache = if manager == project::Manager::Cargo {
-        None
-    } else {
-        let cache = args
-            .cache_dir
-            .clone()
-            .or_else(|| {
-                ProjectDirs::from("", "", "paths-cli").map(|dirs| dirs.cache_dir().to_path_buf())
-            })
-            .context("cannot determine cache directory; use --cache-dir")?;
-        fs::create_dir_all(&cache)?;
-        Some(dunce::canonicalize(cache)?)
-    };
     let mut usage = cache::Usage::default();
-    let mut projects = None;
-    let mut cargo = cargo::Resolver::default();
+    let mut state = Resolver::default();
     let mut failed = false;
     let stdout = io::stdout();
     let mut output = stdout.lock();
     for spec in &args.dependencies {
-        let result = match &cache {
-            Some(cache) => resolve(spec, args, &root, manager, &mut projects, cache),
-            None => project::parse_spec(spec).and_then(|(name, version)| {
-                cargo.resolve(&root, args.filter.as_deref(), name, version)
-            }),
-        };
-        match result {
+        match state.resolve(spec, args, &root, manager) {
             Ok(resolved) => {
                 let path = match &resolved.source {
                     ResolvedSource::Git(source) => {
@@ -180,7 +274,7 @@ fn run(args: &Args) -> Result<bool> {
             }
         }
     }
-    if let Some(cache) = cache {
+    if let Some(cache) = state.cache {
         usage.cleanup(&cache, cache::MAX_BYTES);
     }
     Ok(failed)
