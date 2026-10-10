@@ -466,7 +466,7 @@ fn cache_lru_tracks_usage_and_evicts_oldest() -> Result<()> {
     let head = source::git(&paths[2], &["rev-parse", "HEAD"])?;
     source::checkout(cache.path(), url, &head)?;
     assert!(fs::metadata(paths[2].with_extension("last-used"))?.modified()? > old);
-    assert!(source::git(&paths[2], &["status", "--porcelain"])?.is_empty());
+    assert_eq!(source::git(&paths[2], &["status", "--porcelain"])?, "");
     fs::remove_file(paths[1].with_extension("last-used"))?;
     let total = paths
         .iter()
