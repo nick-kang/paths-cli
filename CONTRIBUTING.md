@@ -21,6 +21,7 @@ Run the CLI locally:
 cargo run --locked -- --help
 cargo run --locked -- --package-manager pnpm react@19.0.0 --json
 cargo run --locked -- serde --json
+cargo run --locked -- https://github.com/pthm/melange --ref main --json
 ```
 
 This repository has both Node and Cargo manifests. Lookups search both dependency graphs and return a sole match; use an explicit package manager when both match or when requesting an uninstalled Node version. Cargo lookups use the local resolved sources and preserve `Cargo.lock`; run `cargo fetch` first if the lockfile is missing or stale.
@@ -38,7 +39,7 @@ node tests/smoke.ts
 
 Use `cargo fmt --all` to apply formatting. Clippy's `all` and `pedantic` groups are enforced, `unwrap` and `expect` are denied, and unsafe Rust is forbidden.
 
-The Rust tests cover Node and Cargo dependency selection, repository resolution, and cache behavior. The smoke test exercises npm and pnpm against a temporary local registry and Git repository, plus Cargo projects with local path and Git dependencies. It checks mixed-project matches and collisions, lockfile preservation, and cache bypass, and installs the packed CLI into an isolated global prefix without changing your normal global installation. npm, pnpm, and Cargo must be on `PATH`.
+The Rust tests cover Node and Cargo dependency selection, repository resolution, and cache behavior. The smoke test exercises npm and pnpm against a temporary local registry and Git repository, plus Cargo projects with local path and Git dependencies. Direct GitHub URL tests use Git URL rewriting to that local repository and cover standalone lookups, refs, moving branches, offline pinned-cache reuse, and mixed batches. It also checks mixed-project matches and collisions, lockfile preservation, and cache bypass, and installs the packed CLI into an isolated global prefix without changing your normal global installation. npm, pnpm, and Cargo must be on `PATH`.
 
 `node scripts/package.ts` stages the release binary for your current platform under `bin/`. Rebuild and stage it again after changing Rust code. Local packaging and smoke tests require one of the supported platforms listed in [README.md](README.md).
 

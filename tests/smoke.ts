@@ -24,7 +24,7 @@ type Manifest = {
 };
 type Result = {
   request: string;
-  result?: { name: string; version: string; method: string; commit?: string; repository?: string; path: string };
+  result?: { name?: string; version?: string; method: string; commit?: string; repository?: string; path: string };
   error?: string;
 };
 type Packed = { filename: string; shasum: string };
@@ -46,6 +46,77 @@ async function run(args: string[], cwd: string, env: NodeJS.ProcessEnv, code = 0
 function writeJson(path: string, value: unknown): void {
   mkdirSync(dirname(path), { recursive: true });
   writeFileSync(path, JSON.stringify(value));
+}
+
+async function checkRepositories(
+  temp: string, env: NodeJS.ProcessEnv, cli: string, repo: string, commits: Record<string, string>,
+): Promise<void> {
+  const outside = join(temp, 'outside-project');
+  mkdirSync(outside);
+  const args = [cli, '--cache-dir', join(temp, 'repository-cache')];
+  const pinned = (JSON.parse(await run([...args, `${REPOSITORY}.git/`, '--ref', commits['1.0.0'], '--json'], outside, env)) as Result).result;
+  assert.ok(pinned);
+  assert.deepEqual(Object.keys(pinned).sort(), ['commit', 'method', 'path', 'repository']);
+  assert.equal(pinned.repository, REPOSITORY);
+  assert.equal(pinned.commit, commits['1.0.0']);
+  assert.equal(pinned.method, 'ref');
+  assert.equal(readFileSync(join(pinned.path, 'source.rs'), 'utf8'), '1.0.0');
+  const head = (JSON.parse(await run([...args, REPOSITORY, '--json'], outside, env)) as Result).result;
+  assert.ok(head);
+  assert.equal(head.commit, commits['2.0.0']);
+  assert.equal(head.method, 'default-branch');
+  for (const reference of ['main', 'refs/heads/main', 'HEAD']) {
+    const result = (JSON.parse(await run([...args, REPOSITORY, '--ref', reference, '--json'], outside, env)) as Result).result;
+    assert.equal(result?.path, head.path);
+    assert.equal(result?.method, 'ref');
+  }
+  await run(['git', 'tag', 'light', commits['1.0.0']], repo, env);
+  await run(['git', 'tag', '-a', 'release', '-m', 'release', commits['1.0.0']], repo, env);
+  for (const reference of ['light', 'release', 'refs/tags/release']) {
+    assert.equal(await run([...args, REPOSITORY, '--ref', reference], outside, env), pinned.path);
+  }
+  await run(['git', 'branch', 'moving', commits['1.0.0']], repo, env);
+  assert.equal(await run([...args, REPOSITORY, '--ref', 'moving'], outside, env), pinned.path);
+  await run(['git', 'branch', '-f', 'moving', commits['2.0.0']], repo, env);
+  assert.equal(await run([...args, REPOSITORY, '--ref', 'moving'], outside, env), head.path);
+  await run(['git', 'tag', 'moving', commits['2.0.0']], repo, env);
+  await run([...args, REPOSITORY, '--ref', 'moving'], outside, env, 1, /ambiguous Git ref.*refs\/heads\/moving.*refs\/tags\/moving/);
+  for (const reference of ['refs/heads/moving', 'refs/tags/moving']) {
+    assert.equal(await run([...args, REPOSITORY, '--ref', reference], outside, env), head.path);
+  }
+  const offline = { ...env, GIT_ALLOW_PROTOCOL: '' };
+  assert.equal(await run([...args, REPOSITORY, '--ref', commits['1.0.0'].toUpperCase()], outside, offline), pinned.path);
+  await run([...args, REPOSITORY, '--ref', 'main'], outside, offline, 1, /transport.*not allowed/);
+  await run([...args, REPOSITORY], outside, offline, 1, /transport.*not allowed/);
+  for (const reference of ['missing', '0'.repeat(40)]) {
+    const result = JSON.parse(await run([...args, REPOSITORY, '--ref', reference, '--json'], outside, env, 1)) as Result;
+    assert.ok(result.error);
+    assert.equal(result.result, undefined);
+  }
+  const invalidCache = join(temp, 'invalid-ref-cache');
+  for (const reference of ['deadbeef', 'main~1', 'main:other', '*']) {
+    await run([cli, '--cache-dir', invalidCache, REPOSITORY, '--ref', reference], outside, env, 2);
+  }
+  for (const requests of [['react'], [REPOSITORY, REPOSITORY], [REPOSITORY, 'react']]) {
+    await run([...args, ...requests, '--ref', 'main'], outside, env, 2, /--ref requires exactly one/);
+  }
+  assert.equal(existsSync(invalidCache), false);
+  const requests = [REPOSITORY, 'not-installed', `${REPOSITORY}/tree/main`, `${REPOSITORY}.git`];
+  const batch: Result[] = (await run([...args, ...requests, '--json'], outside, env, 1)).split('\n').map((line) => JSON.parse(line));
+  assert.deepEqual(batch.map((record) => record.request), requests);
+  assert.equal(batch[0].result?.path, head.path);
+  assert.match(batch[1].error ?? '', /no matching project manifest/);
+  assert.match(batch[2].error ?? '', /repository root URL/);
+  assert.equal(batch[3].result?.path, head.path);
+
+  // Broken manifests and package-only flags must not affect URL lookups.
+  writeFileSync(join(outside, 'package.json'), 'invalid json');
+  writeFileSync(join(outside, 'Cargo.toml'), 'invalid toml');
+  assert.equal(await run([...args, REPOSITORY, '--package-manager', 'cargo', '--filter', 'missing'], outside, env), head.path);
+  writeFileSync(join(pinned.path, 'source.rs'), 'modified');
+  await run([...args, REPOSITORY, '--ref', commits['1.0.0']], outside, env, 1, /cached source was modified/);
+  assert.equal(readFileSync(join(pinned.path, 'source.rs'), 'utf8'), 'modified');
+  console.log('GitHub URLs: standalone requests, refs, JSON, batches, moving branches, offline pins, and cache protection passed');
 }
 
 async function checkManager(
@@ -103,6 +174,13 @@ async function checkManager(
   assert.equal(await run([...args, '--filter', 'packages/b', 'paths-fixture'], nested, env), second.path);
   assert.equal(await run([...args, 'paths-fixture@2.0.0'], project, env), second.path);
   assert.ok(await run([...args, '@fixture/parent'], project, env));
+  const mixedRequests = ['paths-fixture', REPOSITORY, 'not-installed', `${REPOSITORY}.git/`];
+  const mixed: Result[] = (await run([...args, ...mixedRequests, '--json'], project, env, 1)).split('\n').map((line) => JSON.parse(line));
+  assert.deepEqual(mixed.map((record) => record.request), mixedRequests);
+  assert.equal(mixed[0].result?.path, first.path);
+  assert.equal(mixed[1].result?.path, second.path);
+  assert.ok(mixed[2].error);
+  assert.equal(mixed[3].result?.path, second.path);
 
   // Alias-only installation must resolve both the alias and the actual package name.
   const manifestPath = join(project, 'packages', 'a', 'package.json');
@@ -359,6 +437,7 @@ async function main(): Promise<void> {
       const expected = JSON.parse(readFileSync(join(ROOT, 'package.json'), 'utf8')).version;
       assert.equal(await run([cli, '--version'], temp, env), `paths ${expected}`);
       assert.ok((await run([cli, '--help'], temp, env)).includes('--package-manager'));
+      await checkRepositories(temp, env, cli, repo, commits);
       for (const manager of ['npm', 'pnpm'] as const) {
         await checkManager(manager, temp, env, registry, cli, commits);
       }

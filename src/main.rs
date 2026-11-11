@@ -11,8 +11,8 @@ use std::{
     process::ExitCode,
 };
 
-use anyhow::{Context, Result, bail};
-use clap::Parser;
+use anyhow::{Context, Result, bail, ensure};
+use clap::{CommandFactory, Parser};
 use directories::ProjectDirs;
 use serde::Serialize;
 use serde_json::Value;
@@ -21,12 +21,15 @@ use serde_json::Value;
 #[command(
     name = "paths",
     version,
-    about = "Print local source paths for npm, pnpm, and Rust dependencies"
+    about = "Print local source paths for dependencies and GitHub repositories"
 )]
 struct Args {
-    /// Dependency names or name@exact-version requests
-    #[arg(required = true)]
+    /// Dependency names, name@exact-version requests, or HTTPS GitHub repository URLs
+    #[arg(required = true, value_name = "REQUEST")]
     dependencies: Vec<String>,
+    /// Full commit hash, branch, tag, or HEAD (requires exactly one repository URL)
+    #[arg(long = "ref", value_name = "REF", value_parser = source::parse_reference)]
+    reference: Option<String>,
     /// Exact workspace name or path relative to the project root
     #[arg(short = 'F', long)]
     filter: Option<String>,
@@ -36,9 +39,29 @@ struct Args {
     /// Emit one JSON result per request, including failures
     #[arg(long)]
     json: bool,
-    /// Override the platform cache directory (npm/pnpm only)
+    /// Override the checkout cache directory (npm/pnpm and GitHub URLs)
     #[arg(long)]
     cache_dir: Option<PathBuf>,
+}
+
+impl Args {
+    fn validate(&self) -> Result<()> {
+        if self.reference.is_some() {
+            ensure!(
+                self.dependencies.len() == 1
+                    && source::repository_request(&self.dependencies[0])?.is_some(),
+                "--ref requires exactly one HTTPS GitHub repository URL"
+            );
+        }
+        Ok(())
+    }
+}
+
+#[derive(Serialize)]
+#[serde(untagged)]
+enum Resolution {
+    Package(Resolved),
+    Repository(source::Source),
 }
 
 #[derive(Serialize)]
@@ -110,13 +133,7 @@ fn node_package(
     }))
 }
 
-fn materialize_node(
-    package: NodePackage,
-    args: &Args,
-    root: &std::path::Path,
-    manager: project::Manager,
-    cache: &mut Option<PathBuf>,
-) -> Result<Resolved> {
+fn source_cache<'a>(cache: &'a mut Option<PathBuf>, args: &Args) -> Result<&'a std::path::Path> {
     if cache.is_none() {
         let path = args
             .cache_dir
@@ -128,7 +145,17 @@ fn materialize_node(
         fs::create_dir_all(&path)?;
         *cache = Some(dunce::canonicalize(path)?);
     }
-    let cache = cache.as_deref().context("missing source cache")?;
+    cache.as_deref().context("missing source cache")
+}
+
+fn materialize_node(
+    package: NodePackage,
+    args: &Args,
+    root: &std::path::Path,
+    manager: project::Manager,
+    cache: &mut Option<PathBuf>,
+) -> Result<Resolved> {
+    let cache = source_cache(cache, args)?;
     let NodePackage {
         name,
         version,
@@ -235,21 +262,45 @@ impl Resolver {
 
 fn run(args: &Args) -> Result<bool> {
     let cwd = dunce::canonicalize(std::env::current_dir()?)?;
-    let (root, manager) = project::discover(&cwd, args.package_manager)?;
+    let mut project = None;
     let mut usage = cache::Usage::default();
     let mut state = Resolver::default();
     let mut failed = false;
     let stdout = io::stdout();
     let mut output = stdout.lock();
     for spec in &args.dependencies {
-        match state.resolve(spec, args, &root, manager) {
+        let result = (|| {
+            if let Some(repository) = source::repository_request(spec)? {
+                return source::materialize_repository(
+                    source_cache(&mut state.cache, args)?,
+                    &repository,
+                    args.reference.as_deref(),
+                )
+                .map(Resolution::Repository);
+            }
+            let (root, manager) = match &project {
+                Some(project) => project,
+                None => project.insert(project::discover(&cwd, args.package_manager)?),
+            };
+            state
+                .resolve(spec, args, root, *manager)
+                .map(Resolution::Package)
+        })();
+        match result {
             Ok(resolved) => {
-                let path = match &resolved.source {
-                    ResolvedSource::Git(source) => {
+                let path = match &resolved {
+                    Resolution::Repository(source)
+                    | Resolution::Package(Resolved {
+                        source: ResolvedSource::Git(source),
+                        ..
+                    }) => {
                         usage.record(source);
                         &source.path
                     }
-                    ResolvedSource::Cargo { path, .. } => path,
+                    Resolution::Package(Resolved {
+                        source: ResolvedSource::Cargo { path, .. },
+                        ..
+                    }) => path,
                 };
                 if args.json {
                     writeln!(
@@ -281,7 +332,13 @@ fn run(args: &Args) -> Result<bool> {
 }
 
 fn main() -> ExitCode {
-    match run(&Args::parse()) {
+    let args = Args::parse();
+    if let Err(error) = args.validate() {
+        Args::command()
+            .error(clap::error::ErrorKind::InvalidValue, error.to_string())
+            .exit();
+    }
+    match run(&args) {
         Ok(false) => ExitCode::SUCCESS,
         Ok(true) => ExitCode::FAILURE,
         Err(error) => {

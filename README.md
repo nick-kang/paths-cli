@@ -1,6 +1,6 @@
 # paths-cli
 
-Get a dependency's local source directory for an AI agent to inspect. Supports npm, pnpm, and Rust Cargo projects.
+Get a dependency's or GitHub repository's local source directory for an AI agent to inspect. Supports npm, pnpm, and Rust Cargo projects, plus direct GitHub repository URLs from any directory.
 
 ## Why use paths?
 
@@ -14,11 +14,11 @@ Coding agents need context to use dependencies correctly. Documentation and web 
 npm i -g paths-cli
 ```
 
-The npm launcher requires Node.js 20+. For npm/pnpm source lookups, install Git 2.25+ and the project's package manager on `PATH`; for Rust, install Cargo on `PATH`. Supports macOS 11+ (Intel/Apple Silicon), Linux with glibc 2.35+ (x64/ARM64), and Windows x64. Yarn, Alpine/musl, and Windows ARM64 are not supported.
+The npm launcher requires Node.js 20+. For npm/pnpm source lookups, install Git 2.25+ and the project's package manager on `PATH`; direct GitHub URL lookups need Git 2.25+ without a package manager or project. For Rust, install Cargo on `PATH`. Supports macOS 11+ (Intel/Apple Silicon), Linux with glibc 2.35+ (x64/ARM64), and Windows x64. Yarn, Alpine/musl, and Windows ARM64 are not supported.
 
 ## Usage
 
-Run inside your project or one of its subdirectories:
+For dependency lookups, run inside your project or one of its subdirectories:
 
 ```sh
 paths react
@@ -28,6 +28,22 @@ paths react@19.0.0
 paths serde                             # In a Rust project
 paths serde@1.0.228
 ```
+
+To inspect a GitHub repository directly, run from any directory:
+
+```sh
+paths https://github.com/pthm/melange
+paths https://github.com/pthm/melange.git --ref 2af57edc200cd14dbd6f1556563ff9ae41830954
+paths https://github.com/pthm/melange --ref main
+paths https://github.com/pthm/melange --ref v1.0.0 --json
+paths react https://github.com/pthm/melange   # Mix requests inside a project
+```
+
+Supply an HTTPS GitHub repository root URL; `.git` and a trailing slash are optional. File, directory, and commit-page URLs are not supported: use the repository root with `--ref` instead. Direct requests do not require the repository to be a project dependency and bypass project discovery, `--filter`, and `--package-manager`.
+
+Without `--ref`, `paths` checks out the current default-branch HEAD. `--ref` accepts a full commit hash, branch, tag, or `HEAD`, and requires exactly one repository URL with no other requests. Abbreviated hashes and revision expressions such as `main~1` are not supported. If a branch and tag share a name, use `refs/heads/<name>` or `refs/tags/<name>`; these forms also allow hexadecimal ref names. Missing or invalid explicit refs fail without falling back to another revision.
+
+Named refs are resolved on every invocation, so moving branches or tags can return a different path later. Full commit hashes reuse an existing clean checkout without a remote lookup. JSON output always reports the full resolved commit. Remote access uses Git's existing credentials and configuration without interactive prompts.
 
 `paths` detects the nearest Node manifest (`package.json` or `pnpm-workspace.yaml`) or `Cargo.toml`, stopping at the Git boundary. If both families occur in that directory, it searches both dependency graphs for each request. A match in only one is returned; a match in both fails with guidance to select `--package-manager npm`, `pnpm`, or `cargo`. For example, `paths serde` works in a mixed project if only Cargo depends on `serde`.
 
@@ -42,7 +58,7 @@ paths --filter web react                 # Select an exact workspace name
 paths --filter ./apps/web react          # Or a path relative to the workspace root
 paths --package-manager npm react        # Override package-manager detection
 paths --package-manager cargo serde --json
-paths --cache-dir .agent-repos react     # Choose where npm/pnpm checkouts are stored
+paths --cache-dir .agent-repos react     # Choose where Git checkouts are stored
 paths react --json                      # Include version and revision information
 paths --help
 ```
@@ -53,13 +69,13 @@ Cargo searches the current package first, or a virtual workspace's default membe
 
 For npm/pnpm, source matching is best effort. `paths` prefers the published commit, then a version tag. If neither is available, it tries a historical commit or the current default branch and warns that the source may differ from the package version.
 
-Npm/pnpm checkouts are reused from your system's cache directory unless you set `--cache-dir`. Treat them as reference material: modified or incomplete checkouts are rejected rather than overwritten. Move an affected checkout aside and retry. The cache is shared across projects for the same OS user and has a fixed 5 GiB soft limit (also applied to each custom `--cache-dir`). After an invocation creates a checkout, `paths` removes least recently used checkouts until under the limit. Cache-only lookups update usage timestamps without scanning sizes. Modified or busy checkouts and all results from the current invocation are preserved, so the cache can exceed the limit. Older checkouts without usage metadata are removed first.
+Npm/pnpm and direct GitHub URL checkouts share your system's cache directory unless you set `--cache-dir`. The same repository and commit reuse the same checkout across both request types. Treat them as reference material: modified or incomplete checkouts are rejected rather than overwritten. Move an affected checkout aside and retry. The cache is shared across projects for the same OS user and has a fixed 5 GiB soft limit (also applied to each custom `--cache-dir`). After an invocation creates a checkout, `paths` removes least recently used checkouts until under the limit. Cache-only lookups update usage timestamps without scanning sizes. Modified or busy checkouts and all results from the current invocation are preserved, so the cache can exceed the limit. Older checkouts without usage metadata are removed first.
 
 Cache locks protect `paths` operations, but cannot detect editors or agents reading previously returned paths; a later invocation may evict those checkouts. Size is measured from filesystem entry lengths, including `.git`, rather than allocated disk blocks. Cleanup failures produce warnings without failing source lookups.
 
 Checkouts omit common binary files, source maps, Git LFS content, and submodules, so some fixtures or examples may be incomplete.
 
-Cargo source directories are managed by Cargo. They bypass the paths cache, usage tracking, and eviction; `--cache-dir` applies only to npm/pnpm. Published crates may omit upstream tests and examples.
+Cargo source directories are managed by Cargo. They bypass the paths cache, usage tracking, and eviction; `--cache-dir` applies only to npm/pnpm and direct GitHub URLs. Published crates may omit upstream tests and examples.
 
 ## Using with AI agents
 
@@ -71,20 +87,21 @@ When dependency behavior is unclear, run `paths <package> --json`. Inspect the r
 Use the source for reference only. Keep changes in this project and continue importing dependencies normally. Check the reported resolution method before assuming the source exactly matches the installed version.
 ```
 
-For npm/pnpm, if your agent can only read files inside the workspace, use `paths react --json --cache-dir .agent-repos` and add `.agent-repos/` to your project's `.gitignore`. Cargo source directories may be outside your workspace.
+For npm/pnpm or direct GitHub URLs, if your agent can only read files inside the workspace, use `--cache-dir .agent-repos` (for example, `paths react --json --cache-dir .agent-repos`) and add `.agent-repos/` to your project's `.gitignore`. Cargo source directories may be outside your workspace.
 
 ## Output
 
-Normal output contains one absolute path per successful request, in input order. Warnings and errors go to stderr. A failed request does not prevent processing the remaining packages.
+Normal output contains one absolute path per successful request, in input order. Warnings and errors go to stderr. A failed request does not prevent processing the remaining requests, including when project discovery fails for a package in a batch containing repository URLs.
 
 `--json` outputs one JSON record per request, with either a `result` or an `error`:
 
 ```json
 {"request":"react","result":{"name":"react","version":"19.0.0","path":"/cache/.../commit","repository":"https://github.com/facebook/react","commit":"...","method":"published"}}
 {"request":"serde","result":{"name":"serde","version":"1.0.228","path":"/cargo/registry/src/.../serde-1.0.228","method":"cargo"}}
+{"request":"https://github.com/pthm/melange.git","result":{"path":"/cache/.../commit","repository":"https://github.com/pthm/melange","commit":"2af57edc200cd14dbd6f1556563ff9ae41830954","method":"ref"}}
 {"request":"missing","error":"installed dependency `missing` not found"}
 ```
 
-For npm/pnpm, `method` is `published`, `tag`, `publication-time`, or `default-branch`; the last two are approximations. Cargo results use `method: "cargo"` and omit `repository` and `commit`. Errors before package processing, such as failure to detect the project, only appear on stderr.
+For npm/pnpm, `method` is `published`, `tag`, `publication-time`, or `default-branch`; the last two are approximations. Cargo results use `method: "cargo"` and omit `repository` and `commit`. Direct repository results omit `name` and `version`; their method is `ref` when `--ref` is supplied, or `default-branch` otherwise. Failures to detect a project are reported per package request. Invocation-wide errors, such as invalid CLI arguments, only appear on stderr.
 
 Exit status is `0` on success, `1` if any request fails, or `2` for invalid CLI arguments.

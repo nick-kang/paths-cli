@@ -71,6 +71,71 @@ pub fn normalize_commit(value: &str) -> Option<String> {
         .then(|| value.to_ascii_lowercase())
 }
 
+pub fn repository_request(spec: &str) -> Result<Option<String>> {
+    if !spec.contains(':') {
+        return Ok(None);
+    }
+    let guidance = "use an HTTPS GitHub repository root URL, for example https://github.com/owner/repo, with --ref for a commit, branch, or tag";
+    let url = Url::parse(spec).context(guidance)?;
+    // Check the original path too: URL parsing removes dot segments and normalizes backslashes.
+    let path = spec
+        .split_once("://")
+        .and_then(|(_, rest)| rest.split_once('/'))
+        .map(|(_, path)| path.trim_end_matches('/'))
+        .context(guidance)?;
+    ensure!(
+        url.scheme() == "https"
+            && url.host_str() == Some("github.com")
+            && url.username().is_empty()
+            && url.password().is_none()
+            && url.port().is_none()
+            && url.query().is_none()
+            && url.fragment().is_none()
+            && !spec.contains('\\')
+            && !spec.chars().any(|c| c.is_whitespace() || c.is_control())
+            && path.split('/').count() == 2,
+        "{guidance}"
+    );
+    normalize_repository(&Value::String(spec.to_owned()))
+        .map(Some)
+        .context(guidance)
+}
+
+#[allow(clippy::case_sensitive_file_extension_comparisons)] // Git ref grammar forbids only lowercase .lock.
+pub fn parse_reference(reference: &str) -> Result<String> {
+    if let Some(commit) = normalize_commit(reference) {
+        return Ok(commit);
+    }
+    ensure!(
+        !(reference.len() >= 4 && reference.bytes().all(|byte| byte.is_ascii_hexdigit())),
+        "use a full commit hash; for a hexadecimal branch or tag name, use refs/heads/<name> or refs/tags/<name>"
+    );
+    let name = if reference.starts_with("refs/") {
+        reference
+            .strip_prefix("refs/heads/")
+            .or_else(|| reference.strip_prefix("refs/tags/"))
+            .context("use refs/heads/<name> or refs/tags/<name>")?
+    } else {
+        reference
+    };
+    ensure!(
+        !name.is_empty()
+            && name != "@"
+            && !name.starts_with('-')
+            && !name.ends_with('.')
+            && !name.contains("..")
+            && !name.contains("@{")
+            && !name
+                .chars()
+                .any(|c| c.is_control() || c == ' ' || "~^:?*[\\".contains(c))
+            && name
+                .split('/')
+                .all(|part| !part.is_empty() && !part.starts_with('.') && !part.ends_with(".lock")),
+        "invalid Git ref; use a full commit hash, branch, tag, or HEAD"
+    );
+    Ok(reference.to_owned())
+}
+
 pub fn provenance_commit(response: &Value, repository: &str) -> Option<String> {
     for attestation in response["attestations"].as_array()? {
         if attestation["predicateType"] != PROVENANCE {
@@ -152,9 +217,12 @@ pub fn published_at(metadata: &Value, version: &str) -> Option<String> {
 }
 
 pub fn tag_commit(references: &str, version: &str) -> Option<String> {
-    let tag = format!("refs/tags/v{version}");
-    let peeled = format!("{tag}^{{}}");
-    for wanted in [&peeled, &tag] {
+    ref_commit(references, &format!("refs/tags/v{version}"))
+}
+
+fn ref_commit(references: &str, reference: &str) -> Option<String> {
+    let peeled = format!("{reference}^{{}}");
+    for wanted in [peeled.as_str(), reference] {
         let commits: HashSet<_> = references
             .lines()
             .filter_map(|line| {
@@ -170,6 +238,28 @@ pub fn tag_commit(references: &str, version: &str) -> Option<String> {
         }
     }
     None
+}
+
+pub fn reference_commit(references: &str, reference: &str) -> Result<String> {
+    let names = if reference == "HEAD" || reference.starts_with("refs/") {
+        vec![reference.to_owned()]
+    } else {
+        vec![
+            format!("refs/heads/{reference}"),
+            format!("refs/tags/{reference}"),
+        ]
+    };
+    let mut commits: Vec<_> = names
+        .iter()
+        .filter_map(|name| ref_commit(references, name))
+        .collect();
+    ensure!(
+        commits.len() <= 1,
+        "ambiguous Git ref `{reference}`; use refs/heads/{reference} or refs/tags/{reference}"
+    );
+    commits
+        .pop()
+        .with_context(|| format!("Git ref `{reference}` not found"))
 }
 
 pub fn revision_unavailable(error: &anyhow::Error) -> bool {
@@ -374,6 +464,7 @@ fn checkout_tracked(cache: &Path, repository: &str, commit: &str) -> Result<(Pat
 #[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub enum Method {
+    Ref,
     Published,
     Tag,
     PublicationTime,
@@ -392,6 +483,48 @@ pub struct Source {
     pub usage_recorded: bool,
 }
 
+fn checkout_source(cache: &Path, repository: &str, commit: &str, method: Method) -> Result<Source> {
+    let (path, created, usage_recorded) = checkout_tracked(cache, repository, commit)?;
+    Ok(Source {
+        created,
+        usage_recorded,
+        path,
+        repository: repository.to_owned(),
+        commit: commit.to_owned(),
+        method,
+    })
+}
+
+pub fn materialize_repository(
+    cache: &Path,
+    repository: &str,
+    reference: Option<&str>,
+) -> Result<Source> {
+    let reference = reference.map(parse_reference).transpose()?;
+    fs::create_dir_all(cache)?;
+    let method = if reference.is_some() {
+        Method::Ref
+    } else {
+        Method::DefaultBranch
+    };
+    let reference = reference.as_deref().unwrap_or("HEAD");
+    let commit = if let Some(commit) = normalize_commit(reference) {
+        commit
+    } else {
+        let references = git(
+            cache,
+            &[
+                "ls-remote",
+                repository,
+                reference,
+                &format!("{reference}^{{}}"),
+            ],
+        )?;
+        reference_commit(&references, reference)?
+    };
+    checkout_source(cache, repository, &commit, method)
+}
+
 fn try_revision(
     cache: &Path,
     repository: &str,
@@ -402,15 +535,8 @@ fn try_revision(
     if !tried.insert(commit.to_owned()) {
         return Ok(None);
     }
-    match checkout_tracked(cache, repository, commit) {
-        Ok((path, created, usage_recorded)) => Ok(Some(Source {
-            created,
-            usage_recorded,
-            path,
-            repository: repository.to_owned(),
-            commit: commit.to_owned(),
-            method,
-        })),
+    match checkout_source(cache, repository, commit, method) {
+        Ok(source) => Ok(Some(source)),
         Err(error) if revision_unavailable(&error) => Ok(None),
         Err(error) => Err(error),
     }
@@ -458,23 +584,6 @@ pub fn materialize(
     {
         return Ok(source);
     }
-    let references = git(cache, &["ls-remote", repository, "HEAD"])?;
-    let commit = references
-        .lines()
-        .find_map(|line| {
-            let mut parts = line.split_whitespace();
-            let commit = normalize_commit(parts.next()?)?;
-            (parts.next()? == "HEAD").then_some(commit)
-        })
-        .context("remote repository has no default-branch commit")?;
     // HEAD may equal an earlier candidate; retry it as the final fallback.
-    let (path, created, usage_recorded) = checkout_tracked(cache, repository, &commit)?;
-    Ok(Source {
-        created,
-        usage_recorded,
-        path,
-        repository: repository.to_owned(),
-        commit,
-        method: Method::DefaultBranch,
-    })
+    materialize_repository(cache, repository, None)
 }

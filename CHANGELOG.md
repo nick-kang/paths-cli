@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.4.0
+
+- Accept direct HTTPS GitHub repository URLs from any directory, without requiring a project dependency.
+- Add `--ref` for full commit hashes, branches, and tags. Resolve the default-branch HEAD when omitted.
+- Support mixed package and repository batches, sharing the existing checkout cache and preserving modified sources.
+
 ## 0.3.1
 
 - Search both dependency graphs in mixed Node/Cargo projects and return a sole match. Require a package-manager override only when both match.

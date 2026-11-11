@@ -2,6 +2,7 @@ use std::{fs, path::Path, process::Command};
 
 use anyhow::{Context, Result, anyhow};
 use base64::{Engine, prelude::BASE64_STANDARD};
+use clap::Parser;
 use serde_json::{Value, json};
 
 use crate::{command, project, source};
@@ -227,6 +228,156 @@ fn repository_urls_and_commits() {
     assert!(source::normalize_commit(&"a".repeat(64)).is_some());
 }
 
+#[test]
+fn direct_repository_requests_validate_root_urls() -> Result<()> {
+    for suffix in ["", "/", ".git", ".git/"] {
+        assert_eq!(
+            source::repository_request(&format!("{REPOSITORY}{suffix}"))?.as_deref(),
+            Some(REPOSITORY)
+        );
+    }
+    assert_eq!(
+        source::repository_request("https://GITHUB.COM/example/source")?.as_deref(),
+        Some(REPOSITORY)
+    );
+    for package in ["react", "react@1.0.0", "@scope/name"] {
+        assert!(source::repository_request(package)?.is_none());
+    }
+    for invalid in [
+        "https://github.com/example/source/tree/main",
+        "https://github.com/example/source/blob/main/file.rs",
+        "https://github.com/example/source/commit/abc",
+        "https://github.com/example/source/../other",
+        "https://github.com/example/%2fsource",
+        "https://github.com/example/source?query",
+        "https://github.com/example/source#main",
+        "https://github.com/example/source\n",
+        "https://github.com/example\\source",
+        "https://github.com/example",
+        "https://github.com/example/.git",
+        "https://user@github.com/example/source",
+        "https://user:secret@github.com/example/source",
+        "https://github.com:123/example/source",
+        "https://github.com.evil.test/example/source",
+        "http://github.com/example/source",
+        "ssh://git@github.com/example/source",
+        "file:///tmp/example/source",
+    ] {
+        let error = source::repository_request(invalid)
+            .err()
+            .context("expected invalid URL")?;
+        assert!(
+            error.to_string().contains("repository root URL"),
+            "{invalid}: {error}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn direct_refs_and_cli_arguments_are_validated() -> Result<()> {
+    assert_eq!(source::parse_reference(&COMMIT.to_uppercase())?, COMMIT);
+    for reference in [
+        "HEAD",
+        "main",
+        "feature/nested/name",
+        "v1.0.0",
+        "main.LOCK",
+        "refs/heads/main",
+        "refs/tags/v1.0.0",
+        "refs/heads/deadbeef",
+    ] {
+        assert_eq!(source::parse_reference(reference)?, reference);
+    }
+    for invalid in [
+        "",
+        "deadbeef",
+        "main~1",
+        "main^",
+        "@",
+        "main@{1}",
+        "--upload-pack=bad",
+        "refs/pull/1/head",
+        "refs/heads/",
+        "refs/heads/-bad",
+        "/main",
+        "main/",
+        "main//other",
+        "main..other",
+        ".main",
+        "main.",
+        "main.lock/other",
+        "a b",
+        "a\nb",
+        "a\tb",
+        "main:other",
+        "*",
+        "[main]",
+        "a?b",
+        "a\\b",
+    ] {
+        assert!(source::parse_reference(invalid).is_err(), "{invalid}");
+    }
+    for requests in [
+        vec!["react"],
+        vec![REPOSITORY, REPOSITORY],
+        vec![REPOSITORY, "react"],
+    ] {
+        let args =
+            crate::Args::try_parse_from(["paths", "--ref", "main"].into_iter().chain(requests))?;
+        assert!(args.validate().is_err());
+    }
+    let args = crate::Args::try_parse_from(["paths", REPOSITORY, "--ref", "main"])?;
+    args.validate()?;
+    let error = crate::Args::try_parse_from(["paths", REPOSITORY, "--ref", "main~1"])
+        .err()
+        .context("expected invalid CLI ref")?;
+    assert_eq!(error.exit_code(), 2);
+    Ok(())
+}
+
+#[test]
+fn direct_refs_match_exact_names_and_peel_tags() -> Result<()> {
+    let tag_object = "b".repeat(40);
+    let references = format!(
+        "{COMMIT}\tHEAD\n{COMMIT}\trefs/heads/main\n{tag_object}\trefs/heads/other/main\n{COMMIT}\trefs/tags/light\n{tag_object}\trefs/tags/release\n{COMMIT}\trefs/tags/release^{{}}\n{COMMIT}\trefs/heads/collision\n{COMMIT}\trefs/tags/collision\n"
+    );
+    for reference in [
+        "HEAD",
+        "main",
+        "refs/heads/main",
+        "light",
+        "release",
+        "refs/tags/release",
+        "refs/heads/collision",
+        "refs/tags/collision",
+    ] {
+        assert_eq!(
+            source::reference_commit(&references, reference)?,
+            COMMIT,
+            "{reference}"
+        );
+    }
+    let error = source::reference_commit(&references, "collision")
+        .err()
+        .context("expected ambiguous ref")?;
+    assert!(error.to_string().contains("ambiguous Git ref"));
+    for reference in ["missing", "refs/tags/main"] {
+        assert!(source::reference_commit(&references, reference).is_err());
+    }
+    assert!(
+        source::reference_commit(&format!("{COMMIT}\trefs/heads/other/main\n"), "main").is_err()
+    );
+    assert!(
+        source::reference_commit(
+            &format!("{COMMIT}\trefs/heads/main\n{tag_object}\trefs/heads/main"),
+            "main"
+        )
+        .is_err()
+    );
+    Ok(())
+}
+
 fn attestations(workflow: &str, dependency: &str, commit: &str) -> Value {
     let statement = json!({"predicateType": "https://slsa.dev/provenance/v1", "predicate": {"buildDefinition": {
         "externalParameters": {"workflow": {"repository": workflow}},
@@ -372,6 +523,33 @@ fn preferred_commit_is_cloned_even_when_tag_is_cached() -> Result<()> {
         fs::read_to_string(result.path.join("published.rs"))?,
         "modified"
     );
+    Ok(())
+}
+
+#[test]
+fn explicit_repository_refs_never_fall_back() -> Result<()> {
+    let repo = repository()?;
+    let cache = tempfile::tempdir()?;
+    let url = repo.path().to_str().context("repository path")?;
+    let head = commit(repo.path(), "source.rs", "2025-01-01T00:00:00Z")?;
+    let result = source::materialize_repository(cache.path(), url, Some(&head))?;
+    assert_eq!(result.method, source::Method::Ref);
+    assert!(result.created && result.usage_recorded);
+    let cached = source::materialize_repository(cache.path(), url, Some(&head.to_uppercase()))?;
+    assert_eq!(cached.path, result.path);
+    assert!(!cached.created && cached.usage_recorded);
+    let default = source::materialize_repository(cache.path(), url, None)?;
+    assert_eq!(default.method, source::Method::DefaultBranch);
+    assert_eq!(default.path, result.path);
+    for reference in ["missing", COMMIT, "main~1"] {
+        assert!(
+            source::materialize_repository(cache.path(), url, Some(reference)).is_err(),
+            "{reference}"
+        );
+    }
+    let blob = source::git(repo.path(), &["rev-parse", "HEAD:source.rs"])?;
+    source::git(repo.path(), &["tag", "blob-tag", &blob])?;
+    assert!(source::materialize_repository(cache.path(), url, Some("blob-tag")).is_err());
     Ok(())
 }
 
